@@ -1,0 +1,17 @@
+[Unit]
+Description=Persistent SSH tunnel to T-Pot Elasticsearch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -p 64295 \
+  -L 127.0.0.1:64298:127.0.0.1:64298 \
+  root@REPLACEME
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
