@@ -1,6 +1,9 @@
-venv/
+# secrets / local state
+config.json
+state.json
+run.log
 *.pyc
 __pycache__/
-state.json
-config.json
-run.log
+.venv/
+venv/
+.lock

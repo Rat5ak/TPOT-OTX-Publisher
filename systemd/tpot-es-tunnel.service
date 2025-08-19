@@ -4,10 +4,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=root
-ExecStart=/usr/bin/autossh -M 0 -N \
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -p 64295 -L 127.0.0.1:64298:127.0.0.1:64298 root@YOUR-TPOT-IP
+Type=simple
+Environment=TPOT_USER=tpotuser
+Environment=TPOT_HOST=YOUR.TPOT.IP.OR.DNS
+Environment=TPOT_SSH_PORT=64295
+Environment=LOCAL_PORT=64298
+Environment=REMOTE_PORT=9200
+ExecStart=/usr/bin/autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -p ${TPOT_SSH_PORT} ${TPOT_USER}@${TPOT_HOST} \
+  -L 127.0.0.1:${LOCAL_PORT}:127.0.0.1:${REMOTE_PORT}
 Restart=always
 RestartSec=5
 
