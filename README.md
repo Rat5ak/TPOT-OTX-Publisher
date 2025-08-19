@@ -1,232 +1,286 @@
-# T-Pot → OTX Publisher (separate VM + persistent SSH tunnel)
+T-Pot → OTX Publisher (separate VM + persistent SSH tunnel)
 
-This pushes **actionable indicators** (IPs / URLs / hashes) from a T-Pot honeypot into **AlienVault OTX** as a Pulse.  
-It runs on a **separate “publisher” VM** and reaches T-Pot’s Elasticsearch via a **persistent SSH tunnel** on a **non-standard SSH port**.
+This pushes actionable indicators (IPs / URLs / hashes) from a T-Pot honeypot into AlienVault OTX as a Pulse.
 
----
+Runs on a separate “publisher” VM
 
-## 📂 Repository Layout
+Reaches T-Pot’s Elasticsearch through a persistent SSH tunnel (non-standard SSH port supported)
 
-```
+Dedupe + cooldown so you don’t spam OTX with identical pulses
+
+📂 Repository Layout
 TPOT-OTX-PUBLISHER/
 ├── publisher/
 │   ├── otx_tpot_publisher.py     # Main Python publisher script
 │   ├── requirements.txt          # Python dependencies
-│   └── README.md                 # This documentation
+│   └── README.md                 # (this file – optional to keep here too)
 │
 ├── systemd/
-│   ├── tpot-es-tunnel.service    # SSH tunnel into T-Pot ES
+│   ├── tpot-es-tunnel.service    # SSH tunnel into T-Pot ES (template)
 │   ├── otx-publisher.service     # Runs publisher once
 │   └── otx-publisher.timer       # Triggers publisher every 6h
 │
-└── .gitignore
-```
+├── .gitignore
+└── config.example.json           # Safe template – copy to config.json on VM
 
----
-
-## Topology
-
-```
+Topology
 Attackers → T-Pot honeypot
    → Elasticsearch (local on T-Pot)
-   → [SSH tunnel over weird port] → Publisher VM
-   → OTX Pulse (with dedupe, no duplicates)
-```
+   → [persistent SSH tunnel] → Publisher VM
+   → OTX Pulse (with dedupe/cooldown)
 
----
 
-## Why separate VM?
+Why a separate VM?
 
-- Keeps honeypot clean, reduces risk of accidental changes on T-Pot.
-- Easier patching, Python/venv, systemd timer, logging.
-- Tunnel can be tightly controlled (no broad network access).
+Keeps the honeypot clean and safer.
 
----
+Easier upgrades (Python venv), logging, and scheduling.
 
-## 1) Prereqs (Publisher VM)
+Tight network controls (only SSH to T-Pot + HTTPS to OTX).
+
+1) Prereqs (Publisher VM)
 
 Ubuntu 24.04+ assumed.
 
-```bash
 sudo apt update
-sudo apt install -y python3 python3-venv autossh jq moreutils ca-certificates
+sudo apt install -y python3 python3-venv autossh jq moreutils ca-certificates git
 sudo mkdir -p /opt/otx-publisher
 sudo chown -R $USER:$USER /opt/otx-publisher
-```
+
 
 Create venv + deps:
 
-```bash
 cd /opt/otx-publisher
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
-```
+pip install -r publisher/requirements.txt
 
----
+2) Config (with placeholders)
 
-## 2) Files to place
+Create /opt/otx-publisher/config.json from the example below.
+(This file is ignored by Git; keep your real key here.)
 
-- `/opt/otx-publisher/publisher/otx_tpot_publisher.py` (main script)
-- `/opt/otx-publisher/publisher/requirements.txt`
-- `/opt/otx-publisher/publisher/README.md`
-- `/etc/systemd/system/tpot-es-tunnel.service` (edit IP/port)
-- `/etc/systemd/system/otx-publisher.service`
-- `/etc/systemd/system/otx-publisher.timer`
+config.example.json (commit this)
 
-Lock down secrets:
+{
+  "otx_api_key": "PUT-YOUR-REAL-OTX-API-KEY-HERE",
+  "elasticsearch": {
+    "host": "http://127.0.0.1:64298",
+    "timeout": 10
+  },
+  "indices": ["logstash-*"],
+  "pulse": {
+    "name_prefix": "Honeypot Data – Cowrie/T-Pot",
+    "time_window_hours": 24,
+    "min_event_count": 3,
+    "exclude_private_ips": true,
+    "tlp": "green"
+  },
+  "limits": {
+    "max_indicators": 2000
+  },
+  "publish": {
+    "skip_if_same": true,
+    "min_delta_indicators": 0,
+    "republish_same_after_hours": 24,
+    "min_interval_minutes": 1440
+  },
+  "log_path": "/opt/otx-publisher/run.log"
+}
 
-```bash
+
+Then on the VM:
+
+cp config.example.json config.json
+# edit the key & any settings you need
 chmod 600 /opt/otx-publisher/config.json
-```
 
----
+3) SSH Tunnel (Publisher VM → T-Pot)
 
-## 3) SSH tunnel (Publisher VM → T-Pot)
+This keeps a local ES port (64298) permanently forwarded to T-Pot’s ES (also 64298), over SSH port you choose.
 
-Edit `systemd/tpot-es-tunnel.service`:
+systemd/tpot-es-tunnel.service
 
-- Replace `IP` with your T-Pot public IP
-- Replace `-p 64298` with your T-Pot SSH port (T-Pot defaults to a non-22 port)
-- Ensure T-Pot allows SSH key auth for the chosen user
+[Unit]
+Description=Persistent SSH tunnel to T-Pot Elasticsearch
+After=network-online.target
+Wants=network-online.target
 
-Enable tunnel:
+[Service]
+Type=simple
+# EDIT THESE: user, host, ssh port
+ExecStart=/usr/lib/autossh/autossh -M 0 -N \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -p <TPOT_SSH_PORT> <TPOT_SSH_USER>@<TPOT_PUBLIC_IP> \
+  -L 127.0.0.1:64298:127.0.0.1:64298
+Restart=always
+RestartSec=5s
 
-```bash
+[Install]
+WantedBy=multi-user.target
+
+
+Install + enable:
+
+sudo cp systemd/tpot-es-tunnel.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tpot-es-tunnel.service
-```
 
-Check:
 
-```bash
+Verify:
+
 ss -ltnp | grep 64298
 curl -s http://127.0.0.1:64298/_cluster/health | jq .status   # expect "green" or "yellow"
-```
 
----
-
-## 4) Configure the publisher
-
-Edit `/opt/otx-publisher/config.json`:
-
-```json
-{
-  "otx_api_key": "YOUR-OTX-API-KEY",
-  "elasticsearch": { "host": "http://127.0.0.1:64298" },
-  "indices": ["logstash-*"],
-  "time_window_hours": 24,
-  "min_event_count": 3,
-  "tlp": "green"
-}
-```
-
----
-
-## 5) First run (manual)
-
-```bash
+4) First Run (manual)
 source /opt/otx-publisher/venv/bin/activate
 
 # Dry run (collect only)
 python /opt/otx-publisher/publisher/otx_tpot_publisher.py --dry-run --config /opt/otx-publisher/config.json
 
-# Real run (publishes + writes state.json)
+# Real run (publishes + writes /opt/otx-publisher/state.json)
 python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
 
 # Second run should SKIP if nothing changed
 python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
-```
 
-State file:
 
-```bash
+Check state / logs:
+
 jq . /opt/otx-publisher/state.json
-```
+tail -n 100 /opt/otx-publisher/run.log
 
-Dedup works by fingerprinting all indicators (sorted), so identical sets don’t re-publish.
 
----
+How dedupe works: all indicators (IPs/URLs/hashes) are sorted then hashed (SHA256).
+If the fingerprint matches the last run, it skips (with optional cooldown/cadence from publish section).
 
-## 6) Automate with systemd timer
+5) Automate with systemd
 
-```bash
+systemd/otx-publisher.service
+
+[Unit]
+Description=Publish T-Pot IOCs to OTX
+After=network-online.target tpot-es-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/otx-publisher
+# Use flock to avoid overlapping runs
+ExecStart=/usr/bin/flock -n /opt/otx-publisher/.lock \
+  /opt/otx-publisher/venv/bin/python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
+StandardOutput=append:/opt/otx-publisher/run.log
+StandardError=append:/opt/otx-publisher/run.log
+
+
+systemd/otx-publisher.timer
+
+[Unit]
+Description=Run OTX publisher every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:17:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+
+Install + start:
+
+sudo cp systemd/otx-publisher.* /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now otx-publisher.timer
 systemctl list-timers | grep otx-publisher
-```
 
-Runs every 6h (`OnCalendar=*-*-* 00/6:17:00`) with a small randomized delay.  
-The service uses `flock` so runs don’t overlap.
 
-Manual triggers:
+Manual trigger:
 
-```bash
 sudo systemctl start otx-publisher.service
-```
 
-Logs:
+6) Troubleshooting
 
-```bash
+Tunnel down
+
+systemctl status tpot-es-tunnel --no-pager
+curl -s http://127.0.0.1:64298/_cluster/health | jq .status
+
+
+OTX auth
+
+Wrong API key → fix config.json
+
+Outbound egress blocked? allow HTTPS to otx.alienvault.com
+
+No data
+
+curl -s http://127.0.0.1:64298/_cat/indices?h=index | sort
+# adjust indices or lower "min_event_count"
+
+
+Force publish (ignore dedupe)
+
+rm -f /opt/otx-publisher/state.json
+python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
+
+
+Logs
+
 tail -n 100 /opt/otx-publisher/run.log
-journalctl -u otx-publisher --since "2h" --no-pager
-```
+journalctl -u otx-publisher --since "12h" --no-pager
 
----
+7) Security / Privacy
 
-## 7) Troubleshooting
+Keep real config.json on the VM only (git-ignored).
 
-- **Tunnel down:**
-  ```bash
-  systemctl status tpot-es-tunnel --no-pager
-  curl -s http://127.0.0.1:64298/_cluster/health | jq .status
-  ```
+Only IOCs (IPs/URLs/hashes) are exported; no session data or PII.
 
-- **OTX auth:**
-  - Wrong API key → check `config.json`
-  - Outbound blocked → allow HTTPS to `otx.alienvault.com`
+Consider using tlp: "green" for public sharing; otherwise make pulses private.
 
-- **No data:**
-  - Indices mismatch → run:
-    ```bash
-    curl -s http://127.0.0.1:64298/_cat/indices?h=index | sort
-    ```
-  - Adjust `min_event_count` lower if too strict.
+8) What You Should See
 
-- **Force publish despite dedupe:**
-  ```bash
-  python otx_tpot_publisher.py --config config.json --force
-  ```
+New IOCs:
 
-- **Reset dedupe (will re-publish same set):**
-  ```bash
-  rm -f /opt/otx-publisher/state.json
-  ```
+INFO - Published pulse: Honeypot Data – Cowrie/T-Pot – last 24h (id=...)
 
----
 
-## 8) Safety notes
+Unchanged:
 
-- Publisher VM is separate from T-Pot (good opsec).
-- Outbound on publisher can be tighter (only OTX + SSH to T-Pot).
-- No PII: we only export IOCs (IPs/URLs/hashes), not raw commands or creds.
-- Use `tlp: green` for public; otherwise set `"public": false`.
-
----
-
-## 9) What you should see
-
-When new IOCs exist:
-
-```
-INFO - Published pulse: Honeypot Data – Cowrie/T-Pot (<host>) – last 24h (id=...)
-```
-
-When unchanged:
-
-```
 INFO - Indicators unchanged since last publish (fingerprint match) — skipping.
-```
 
-That’s it. Clean, repeatable, and no OTX duplicates.
+.gitignore (commit this)
+# Local config / secrets / state
+config.json
+state.json
+run.log
+
+# Python build stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+publisher/requirements.txt
+requests
+OTXv2
+
+
+(If your Python warns about system package management, venv avoids that.)
+
+Notes
+
+The pulse title avoids embedding hostnames (stays consistent).
+
+Dedupe uses a content fingerprint plus a cooldown (min_interval_minutes) and a fallback republish window (republish_same_after_hours) so if attackers keep hammering with the same 157 IPs all day, you don’t publish 4 identical pulses in a row.
+
+You can relax/tighten noise with min_event_count and time_window_hours.

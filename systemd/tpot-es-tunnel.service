@@ -7,9 +7,7 @@ Wants=network-online.target
 User=root
 ExecStart=/usr/bin/autossh -M 0 -N \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-  -p 64295 \
-  -L 127.0.0.1:64298:127.0.0.1:64298 \
-  root@REPLACEME
+  -p 64295 -L 127.0.0.1:64298:127.0.0.1:64298 root@YOUR-TPOT-IP
 Restart=always
 RestartSec=5
 
