@@ -23,6 +23,10 @@ def _utc_iso(dt: datetime) -> str: return dt.replace(tzinfo=timezone.utc).isofor
 def es_health(es_host: str, timeout: int) -> bool:
     try:
         r = requests.get(f"{es_host}/_cluster/health", timeout=timeout)
+        if r.status_code >= 400:
+
+            logger.error(f"OTX error body: {r.text[:2000]}")
+
         r.raise_for_status()
         return r.json().get("status") in ("yellow","green")
     except Exception:
@@ -205,7 +209,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
         for fld in hash_fields:
             try:
                 for hv, cnt, sensors in composite_iter(idx, fld, "h"):
-                    if not isinstance(hv,str) or len(hv)<32: continue
+                    if not isinstance(hv,str) or len(hv) not in (32,40,64,128): continue
                     hv = hv.lower()
                     iocs["hashes"].add(hv)
                     if sensors: meta["hashes"].setdefault(hv,set()).update(sensors)
@@ -307,6 +311,7 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
 
 
 
+
 def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     tlp = cfg["pulse"]["tlp"].upper()
     prefix = cfg["pulse"]["name_prefix"]
@@ -331,11 +336,6 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         ss = ", ".join(sorted(set(visible))) if visible else "unknown"
         return f"{base} • {ss}"
 
-    def role_for(itype: str):
-        if itype.startswith("FileHash"): return "malware"
-        if itype == "URL": return "malware_hosting"
-        return None  # IPv4 → no role
-
     def desc_for(sensors: list[str]) -> str:
         s = ", ".join(sorted(set([t for t in sensors if not str(t).startswith('role:')]))) or "unknown"
         return (f"Observed on T-Pot within last {window}h; sensors={s}; "
@@ -343,7 +343,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
 
     indicators = []
 
-    # IPs (NO role:attacker tag anymore)
+    # IPs
     for ip in sorted(iocs.get("ipv4", [])):
         tags = _clean_tags(sorted(meta["ipv4"].get(ip, set())) or ["unknown"])
         indicators.append({
@@ -354,36 +354,29 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
             "tags": tags
         })
 
-    # URLs (keep OTX role + tag)
+    # URLs (keep role only for URLs)
     for u in sorted(iocs.get("urls", [])):
         tags = _clean_tags(sorted(meta["urls"].get(u, set())) or ["unknown"])
-        r = role_for("URL")
-        if r: tags = sorted(set(tags + [f"role:{r}"]))
-        ind = {
+        indicators.append({
             "indicator": u,
             "type": "URL",
             "title": title_with(tags, "Payload URL"),
             "description": desc_for(tags),
-            "tags": tags
-        }
-        if r: ind["role"] = r
-        indicators.append(ind)
+            "tags": tags,
+            "role": "malware_hosting"
+        })
 
-    # Hashes (keep OTX role + tag)
+    # Hashes (no role on hashes)
     for h in sorted(iocs.get("hashes", [])):
         itype = "FileHash-SHA256" if len(h) == 64 else "FileHash-MD5"
         tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
-        r = role_for(itype)
-        if r: tags = sorted(set(tags + [f"role:{r}"]))
-        ind = {
+        indicators.append({
             "indicator": h,
             "type": itype,
             "title": title_with(tags, "Dropped File Hash"),
             "description": desc_for(tags),
             "tags": tags
-        }
-        if r: ind["role"] = r
-        indicators.append(ind)
+        })
 
     return {
         "name": name,
@@ -394,9 +387,9 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         "indicators": indicators
     }
 def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logger):
-    ip_cnt  = sum(1 for i in pulse["indicators"] if i["type"]=="IPv4")
-    url_cnt = sum(1 for i in pulse["indicators"] if i["type"]=="URL")
-    hash_cnt= sum(1 for i in pulse["indicators"] if i["type"].startswith("FileHash"))
+    ip_cnt  = sum(1 for i in pulse["indicators"] if i.get("type") == "IPv4")
+    url_cnt = sum(1 for i in pulse["indicators"] if i.get("type") == "URL")
+    hash_cnt= sum(1 for i in pulse["indicators"] if str(i.get("type","")).startswith("FileHash"))
     logger.info(f"Pulse indicators: IPs={ip_cnt}, URLs={url_cnt}, Hashes={hash_cnt}")
     if dry_run:
         logger.info("DRY-RUN: not publishing to OTX")
@@ -404,18 +397,33 @@ def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logg
     try:
         r = requests.post(
             "https://otx.alienvault.com/api/v1/pulses/create/",
-            headers={"X-OTX-API-KEY": api_key, "User-Agent":"otx-publisher/1.0",
-                     "Content-Type":"application/json"},
-            data=json.dumps(pulse), timeout=60
+            headers={
+                "X-OTX-API-KEY": api_key,
+                "User-Agent": "otx-publisher/1.0",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(pulse),
+            timeout=60
         )
+        if r.status_code >= 400:
+            # print the body so we know *why* (e.g. "too many indicators")
+            body = r.text
+            logger.error(f"OTX error {r.status_code}: {body[:2000]}")
         r.raise_for_status()
         created = r.json()
+        try:
+            types = {}
+            for ind in created.get('indicators', []):
+                t = ind.get('type','')
+                types[t] = types.get(t,0)+1
+            logging.getLogger('otx-publisher').info(f"OTX stored types: {types}")
+        except Exception as e:
+            logging.getLogger('otx-publisher').warning(f"Could not count OTX stored types: {e}")
         logger.info(f"Published pulse: {created.get('name','(no name)')} (id={created.get('id','?')})")
         return created
     except Exception as e:
         logger.error(f"OTX publish failed: {e}")
         raise
-
 # ---------------- main ----------------
 def main():
     p=argparse.ArgumentParser()
