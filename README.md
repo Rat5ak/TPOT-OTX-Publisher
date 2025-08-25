@@ -1,11 +1,8 @@
 # T-Pot → OTX Publisher
 
-Publishes **indicators of compromise** (IPs, URLs, file hashes) from a [T-Pot honeypot](https://github.com/telekom-security/tpotce) into [AlienVault OTX](https://otx.alienvault.com) as Pulses.
+Publishes indicators of compromise (IPs, URLs, file hashes) from a T-Pot honeypot into AlienVault OTX as Pulses.
 
-✅ Deduplicated & cooldown logic (no OTX spam)
-✅ Runs on a **separate “publisher” VM** (not on the honeypot)
-✅ Connects to T-Pot’s Elasticsearch over a **persistent SSH tunnel**
-✅ Lightweight systemd units for tunnel + publisher
+✅ Deduplicated & cooldown logic (no OTX spam) · ✅ Runs on a separate “publisher” VM (not on the honeypot) · ✅ Connects to T-Pot’s Elasticsearch over a persistent SSH tunnel · ✅ Lightweight systemd units for tunnel + publisher
 
 ---
 
@@ -40,7 +37,7 @@ Attackers → T-Pot honeypot
 
 ---
 
-## 1. Publisher VM Setup
+## 1) Publisher VM Setup
 
 Ubuntu 22.04/24.04 tested.
 
@@ -56,7 +53,7 @@ pip install -r publisher/requirements.txt
 
 ---
 
-## 2. Configuration
+## 2) Configuration
 
 Copy the example and add your real OTX API key:
 
@@ -65,7 +62,7 @@ cp config.example.json config.json
 chmod 600 config.json
 ```
 
-`config.example.json`:
+**`config.example.json`:**
 
 ```json
 {
@@ -95,9 +92,9 @@ chmod 600 config.json
 
 ---
 
-## 3. Persistent SSH Tunnel
+## 3) Persistent SSH Tunnel
 
-`systemd/tpot-es-tunnel.service`:
+**`systemd/tpot-es-tunnel.service`:**
 
 ```ini
 [Unit]
@@ -129,7 +126,7 @@ curl -s http://127.0.0.1:64298/_cluster/health | jq .status
 
 ---
 
-## 4. First Run
+## 4) First Run
 
 ```bash
 source /opt/otx-publisher/venv/bin/activate
@@ -146,9 +143,9 @@ tail -n 50 run.log
 
 ---
 
-## 5. Automate with systemd
+## 5) Automate with systemd
 
-`systemd/otx-publisher.service`:
+**`systemd/otx-publisher.service`:**
 
 ```ini
 [Unit]
@@ -165,7 +162,7 @@ StandardOutput=append:/opt/otx-publisher/run.log
 StandardError=append:/opt/otx-publisher/run.log
 ```
 
-`systemd/otx-publisher.timer` (daily at 03:17 UTC):
+**`systemd/otx-publisher.timer` (daily at 03:17 UTC):**
 
 ```ini
 [Unit]
@@ -193,7 +190,7 @@ systemctl list-timers | grep otx
 
 ---
 
-## 6. Troubleshooting
+## 6) Troubleshooting
 
 **Tunnel down?**
 
@@ -214,7 +211,7 @@ rm -f state.json
 python publisher/otx_tpot_publisher.py --config config.json
 ```
 
-Logs:
+**Logs:**
 
 ```bash
 tail -n 100 run.log
@@ -223,11 +220,11 @@ journalctl -u otx-publisher.service --since "12h"
 
 ---
 
-## 7. Security Notes
+## 7) Security Notes
 
 * Don’t commit `config.json` or `state.json` (they’re gitignored).
 * Only IOCs are shared (IPs, URLs, hashes) — no raw session data.
-* Choose `tlp: green` for public pulses, `amber/red` for private/internal.
+* Choose `tlp: "green"` for public pulses, `amber`/`red` for private/internal.
 
 ---
 
@@ -246,9 +243,9 @@ INFO - Indicators unchanged since last publish (fingerprint match) — skipping.
 
 ---
 
-### `.gitignore`
+## `.gitignore`
 
-```gitignore
+```
 # Local config / secrets / state
 config.json
 state.json
@@ -267,3 +264,99 @@ venv/
 .vscode/
 ```
 
+---
+
+## ⚙️ Advanced (what this build actually does)
+
+### Composite aggs = pull *everything*
+
+We use **composite aggregations** to walk all unique values (no 10k doc wobble):
+
+* IPs from `src_ip` / `source_ip` / `client_ip`
+* URLs from `url` / `http.url` / `request.url`
+* Hashes from `sha256` / `fileinfo.sha256` / `files.sha256` / `shasum`
+
+Each bucket is tagged using the event’s **`type.keyword`** (e.g., cowrie, suricata, dionaea, …) so you see far fewer “unknown” tags.
+
+### Self-URL filter (safe)
+
+We **drop only URLs that point to the honeypot itself**:
+
+* Hosts exactly equal to your **local/public IP(s)** (auto-detected from **top destination IPs**)
+* Or `localhost` / `127.0.0.1` / `::1`
+
+We **do NOT** drop dashed hostnames like `194-195-253-210.ip.linodeusercontent.com`.
+
+### Cool-off & determinism
+
+* Skips re-publishing if run within `publish.min_interval_minutes` (default **1440** = 24h).
+* systemd timer uses:
+
+  ```ini
+  AccuracySec=1s
+  RandomizedDelaySec=0
+  ```
+
+  for predictable, to-the-second scheduling.
+
+---
+
+## 🎛 Tuning
+
+### “Go big” mode (all the things)
+
+Set these in `config.json`:
+
+```json
+"pulse":  { "min_event_count": 1 },
+"limits": { "max_indicators": 0 }
+```
+
+* `min_event_count` = minimum doc count to include an IP (1 = include everything)
+* `max_indicators` = overall cap (0 = unlimited; if you later cap, we trim IPs by activity but **never truncate URLs/Hashes**)
+
+### Noise control
+
+* Raise `pulse.min_event_count` (e.g., `3` or `5`) to keep only IPs seen multiple times.
+* Keep `pulse.exclude_private_ips: true` to ignore RFC1918 chatter.
+
+---
+
+## 🏷 Sensor tags recognized
+
+We auto-tag indicators from `type.keyword`. Known values/aliases include:
+
+`adbhoney, beelzebub, ciscoasa, citrixhoneypot, conpot, cowrie, ddospot, dicompot, dionaea, docker, elasticpot, elasticsearch, elasticvue, endlessh, ewsposter, fatt, galah, glutton, gopot, h0neytr4p, hellpot, heralding, honeyaml, honeypots, honeytrap, ipphoney, kibana, logstash, log4pot, mailoney, maltrail, medpot, miniprint, p0f, redishoneypot, sentrypeer, spiderfoot, snare, tanner, suricata, wordpot, tpot`
+
+(If you see other `type` values in ES, add them to the map in the script to tag even more precisely.)
+
+---
+
+## ⏱ Quick ops cheats
+
+**Force one publish now (ignoring cooldown):**
+
+```bash
+rm -f /opt/otx-publisher/state.json
+source /opt/otx-publisher/venv/bin/activate
+python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
+tail -n 80 /opt/otx-publisher/run.log
+```
+
+**Check next run time (UTC):**
+
+```bash
+systemctl list-timers --all | grep -i otx
+```
+
+**Verify ES via tunnel:**
+
+```bash
+curl -s http://127.0.0.1:64298/_cluster/health | jq .
+```
+
+---
+
+## 🚨 If OTX ever chokes on huge pulses
+
+Open an issue and we’ll switch to optional **chunked posting** (split into multiple pulses by size or indicator type). The current defaults are fine for most setups.
