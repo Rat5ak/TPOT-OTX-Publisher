@@ -304,37 +304,95 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
         logger.error(f"OTX connectivity init failed: {e}")
         return False
 
+
+
+
 def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
-    tlp=cfg["pulse"]["tlp"].upper(); prefix=cfg["pulse"]["name_prefix"]; window=cfg["pulse"]["time_window_hours"]
-    name=f"{prefix} – last {window}h"
-    desc=("Indicators observed by T-Pot CE honeypots. "
-          "Signals are deduped and filtered (min event count threshold; private IPs excluded). "
-          "Indicators carry per-sensor tags derived from event 'type'. "
-          "Intended for defensive use; infrastructure may be compromised or spoofed. "
-          "Sensor: T-Pot CE.")
-    indicators=[]
-    include_title = bool(cfg.get("pulse",{}).get("include_sensor_in_title", True))
+    tlp = cfg["pulse"]["tlp"].upper()
+    prefix = cfg["pulse"]["name_prefix"]
+    window = cfg["pulse"]["time_window_hours"]
+    me = int(cfg.get("pulse", {}).get("min_event_count", 1))
+    name = f"{prefix} – last {window}h"
+    desc = ("Indicators observed by T-Pot CE honeypots. "
+            "Signals are deduped and filtered (min event count threshold; private IPs excluded). "
+            "Indicators carry per-sensor tags derived from event 'type'. "
+            "Intended for defensive use; infrastructure may be compromised or spoofed. "
+            "Sensor: T-Pot CE.")
+    include_title = bool(cfg.get("pulse", {}).get("include_sensor_in_title", True))
+
     def _clean_tags(tags):
         t = sorted(set(tags))
         return [x for x in t if x != "unknown"] or ["unknown"]
+
+    # keep role:* tags out of the human-facing title
     def title_with(sensors: list[str], base: str) -> str:
         if not include_title: return base
-        ss = ", ".join(sorted(set(sensors))) if sensors else "unknown"
+        visible = [t for t in sensors if not (isinstance(t, str) and t.startswith("role:"))]
+        ss = ", ".join(sorted(set(visible))) if visible else "unknown"
         return f"{base} • {ss}"
-    for ip in sorted(iocs["ipv4"]):
-        tags = _clean_tags(sorted(meta["ipv4"].get(ip, set())) or ["unknown"])
-        indicators.append({"indicator": ip, "type": "IPv4", "title": title_with(tags, "Attacker IP"), "tags": tags})
-    for u in sorted(iocs["urls"]):
-        tags = _clean_tags(sorted(meta["urls"].get(u, set())) or ["unknown"])
-        indicators.append({"indicator": u, "type": "URL", "title": title_with(tags, "Payload URL"), "tags": tags})
-    for h in sorted(iocs["hashes"]):
-        itype = "FileHash-SHA256" if len(h)==64 else "FileHash-MD5"
-        tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
-        indicators.append({"indicator": h, "type": itype, "title": title_with(tags, "Dropped File Hash"), "tags": tags})
-    return {"name":name,"description":desc,"public":(tlp=="GREEN"),"tlp":tlp,
-            "tags":["tpot","honeypot","sensor-tagged","cowrie","suricata","dionaea","honeytrap","p0f","fatt","mailoney","tanner","sentrypeer"],
-            "indicators":indicators}
 
+    def role_for(itype: str):
+        if itype.startswith("FileHash"): return "malware"
+        if itype == "URL": return "malware_hosting"
+        return None  # IPv4 → no role
+
+    def desc_for(sensors: list[str]) -> str:
+        s = ", ".join(sorted(set([t for t in sensors if not str(t).startswith('role:')]))) or "unknown"
+        return (f"Observed on T-Pot within last {window}h; sensors={s}; "
+                f"threshold≥{me}; private IPs excluded.")
+
+    indicators = []
+
+    # IPs (NO role:attacker tag anymore)
+    for ip in sorted(iocs.get("ipv4", [])):
+        tags = _clean_tags(sorted(meta["ipv4"].get(ip, set())) or ["unknown"])
+        indicators.append({
+            "indicator": ip,
+            "type": "IPv4",
+            "title": title_with(tags, "Attacker IP"),
+            "description": desc_for(tags),
+            "tags": tags
+        })
+
+    # URLs (keep OTX role + tag)
+    for u in sorted(iocs.get("urls", [])):
+        tags = _clean_tags(sorted(meta["urls"].get(u, set())) or ["unknown"])
+        r = role_for("URL")
+        if r: tags = sorted(set(tags + [f"role:{r}"]))
+        ind = {
+            "indicator": u,
+            "type": "URL",
+            "title": title_with(tags, "Payload URL"),
+            "description": desc_for(tags),
+            "tags": tags
+        }
+        if r: ind["role"] = r
+        indicators.append(ind)
+
+    # Hashes (keep OTX role + tag)
+    for h in sorted(iocs.get("hashes", [])):
+        itype = "FileHash-SHA256" if len(h) == 64 else "FileHash-MD5"
+        tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
+        r = role_for(itype)
+        if r: tags = sorted(set(tags + [f"role:{r}"]))
+        ind = {
+            "indicator": h,
+            "type": itype,
+            "title": title_with(tags, "Dropped File Hash"),
+            "description": desc_for(tags),
+            "tags": tags
+        }
+        if r: ind["role"] = r
+        indicators.append(ind)
+
+    return {
+        "name": name,
+        "description": desc,
+        "public": (tlp == "GREEN"),
+        "tlp": tlp,
+        "tags": ["tpot","honeypot","sensor-tagged","cowrie","suricata","dionaea","honeytrap","p0f","fatt","mailoney","tanner","sentrypeer"],
+        "indicators": indicators
+    }
 def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logger):
     ip_cnt  = sum(1 for i in pulse["indicators"] if i["type"]=="IPv4")
     url_cnt = sum(1 for i in pulse["indicators"] if i["type"]=="URL")
