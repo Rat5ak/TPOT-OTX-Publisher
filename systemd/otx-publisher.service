@@ -1,13 +1,12 @@
+# /etc/systemd/system/otx-publisher.service
 [Unit]
 Description=Publish T-Pot IOCs to OTX
-After=network-online.target tpot-es-tunnel.service
-Wants=network-online.target tpot-es-tunnel.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/otx-publisher
-# flock prevents overlapping runs
-ExecStart=/usr/bin/flock -n /opt/otx-publisher/.lock \
-  /opt/otx-publisher/venv/bin/python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
+ExecStart=/opt/otx-publisher/venv/bin/python /opt/otx-publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
 StandardOutput=append:/opt/otx-publisher/run.log
 StandardError=append:/opt/otx-publisher/run.log

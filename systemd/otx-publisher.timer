@@ -1,10 +1,13 @@
+# /etc/systemd/system/otx-publisher.timer
 [Unit]
-Description=Run OTX publisher every 6 hours
+Description=Run OTX publisher daily
 
 [Timer]
-OnCalendar=*-*-* 00/6:17:00
-RandomizedDelaySec=120
+OnCalendar=*-*-* 03:17:00
+AccuracySec=1s
+RandomizedDelaySec=0
 Persistent=true
+Unit=otx-publisher.service
 
 [Install]
 WantedBy=timers.target

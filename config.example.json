@@ -1,0 +1,26 @@
+{
+  "elasticsearch": {
+    "host": "http://localhost:9200",
+    "timeout": 10
+  },
+  "indices": [
+    "logstash-*"
+  ],
+  "limits": {
+    "max_indicators": 10000
+  },
+  "pulse": {
+    "time_window_hours": 24,
+    "exclude_private_ips": true,
+    "min_event_count": 5,
+    "tlp": "GREEN",
+    "name_prefix": "Honeypot Data – Cowrie/T-Pot",
+    "include_sensor_in_title": true
+  },
+  "otx_api_key": "PUT-YOUR-REAL-KEY-HERE",
+  "log_path": "/opt/otx-publisher/run.log",
+  "state_path": "/opt/otx-publisher/state.json",
+  "publish": {
+    "min_interval_minutes": 1440
+  }
+}

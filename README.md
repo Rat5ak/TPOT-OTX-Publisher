@@ -1,81 +1,57 @@
-# T-Pot → OTX Publisher (separate VM + persistent SSH tunnel)
+T-Pot → OTX Publisher
 
-This pushes **actionable indicators** (IPs / URLs / hashes) from a **T-Pot honeypot** into **AlienVault OTX** as a Pulse.
+Publishes indicators of compromise (IPs, URLs, file hashes) from a T-Pot honeypot
+ into AlienVault OTX
+ as Pulses.
 
-* Runs on a **separate “publisher” VM**
-* Reaches T-Pot’s Elasticsearch through a **persistent SSH tunnel** (non-standard SSH port supported)
-* **Dedupe + cooldown** so you don’t spam OTX with identical pulses
+✅ Deduplicated & cooldown logic (no OTX spam)
+✅ Runs on a separate “publisher” VM (not on the honeypot)
+✅ Connects to T-Pot’s Elasticsearch over a persistent SSH tunnel
+✅ Lightweight systemd units for tunnel + publisher
 
----
-
-## 📂 Repository Layout
-
-```
+📂 Repository Layout
 TPOT-OTX-PUBLISHER/
 ├── publisher/
 │   ├── otx_tpot_publisher.py     # Main Python publisher script
 │   ├── requirements.txt          # Python dependencies
-│   └── README.md                 # (this file – optional to keep here too)
+│   └── README.md                 # (optional: local usage notes)
 │
 ├── systemd/
-│   ├── tpot-es-tunnel.service    # SSH tunnel into T-Pot ES (template)
+│   ├── tpot-es-tunnel.service    # Keeps SSH tunnel open
 │   ├── otx-publisher.service     # Runs publisher once
-│   └── otx-publisher.timer       # Triggers publisher every 6h
+│   └── otx-publisher.timer       # Schedules publisher (daily or every Xh)
 │
-├── .gitignore
-└── config.example.json           # Safe template – copy to config.json on VM
-```
+├── config.example.json           # Safe template (copy to config.json on VM)
+└── .gitignore
 
----
-
-## Topology
-
-```
+🔗 Topology
 Attackers → T-Pot honeypot
    → Elasticsearch (local on T-Pot)
    → [persistent SSH tunnel] → Publisher VM
-   → OTX Pulse (with dedupe/cooldown)
-```
+   → OTX Pulse
 
-**Why a separate VM?**
+1. Publisher VM Setup
 
-* Keeps the honeypot clean and safer.
-* Easier upgrades (Python venv), logging, and scheduling.
-* Tight network controls (only SSH to T-Pot + HTTPS to OTX).
+Ubuntu 22.04/24.04 tested.
 
----
-
-## 1) Prereqs (Publisher VM)
-
-Ubuntu 24.04+ assumed.
-
-```bash
 sudo apt update
-sudo apt install -y python3 python3-venv autossh jq moreutils ca-certificates git
-sudo mkdir -p /opt/otx-publisher
-sudo chown -R $USER:$USER /opt/otx-publisher
-```
-
-Create venv + deps:
-
-```bash
-cd /opt/otx-publisher
+sudo apt install -y python3 python3-venv autossh jq ca-certificates git
+sudo mkdir -p /opt/otx-publisher && cd /opt/otx-publisher
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r publisher/requirements.txt
-```
 
----
+2. Configuration
 
-## 2) Config (with placeholders)
+Copy the example and add your real OTX API key:
 
-Create **`/opt/otx-publisher/config.json`** from the example below.
-(*This file is ignored by Git; keep your real key here.*)
+cp config.example.json config.json
+chmod 600 config.json
 
-**`config.example.json` (commit this)**
 
-```json
+config.example.json:
+
 {
   "otx_api_key": "PUT-YOUR-REAL-OTX-API-KEY-HERE",
   "elasticsearch": {
@@ -94,32 +70,16 @@ Create **`/opt/otx-publisher/config.json`** from the example below.
     "max_indicators": 2000
   },
   "publish": {
-    "skip_if_same": true,
-    "min_delta_indicators": 0,
-    "republish_same_after_hours": 24,
     "min_interval_minutes": 1440
   },
-  "log_path": "/opt/otx-publisher/run.log"
+  "log_path": "/opt/otx-publisher/run.log",
+  "state_path": "/opt/otx-publisher/state.json"
 }
-```
 
-Then on the VM:
+3. Persistent SSH Tunnel
 
-```bash
-cp config.example.json config.json
-# edit the key & any settings you need
-chmod 600 /opt/otx-publisher/config.json
-```
+systemd/tpot-es-tunnel.service:
 
----
-
-## 3) SSH Tunnel (Publisher VM → T-Pot)
-
-This keeps a **local** ES port (64298) permanently forwarded to **T-Pot’s** ES (also 64298), over **SSH port you choose**.
-
-**`systemd/tpot-es-tunnel.service`**
-
-```ini
 [Unit]
 Description=Persistent SSH tunnel to T-Pot Elasticsearch
 After=network-online.target
@@ -127,7 +87,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# EDIT THESE: user, host, ssh port
 ExecStart=/usr/lib/autossh/autossh -M 0 -N \
   -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
   -p <TPOT_SSH_PORT> <TPOT_SSH_USER>@<TPOT_PUBLIC_IP> \
@@ -137,57 +96,30 @@ RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
-```
 
-Install + enable:
 
-```bash
+Enable + check:
+
 sudo cp systemd/tpot-es-tunnel.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tpot-es-tunnel.service
-```
+curl -s http://127.0.0.1:64298/_cluster/health | jq .status
 
-Verify:
-
-```bash
-ss -ltnp | grep 64298
-curl -s http://127.0.0.1:64298/_cluster/health | jq .status   # expect "green" or "yellow"
-```
-
----
-
-## 4) First Run (manual)
-
-```bash
+4. First Run
 source /opt/otx-publisher/venv/bin/activate
+python publisher/otx_tpot_publisher.py --dry-run --config config.json   # test only
+python publisher/otx_tpot_publisher.py --config config.json            # publish
 
-# Dry run (collect only)
-python /opt/otx-publisher/publisher/otx_tpot_publisher.py --dry-run --config /opt/otx-publisher/config.json
 
-# Real run (publishes + writes /opt/otx-publisher/state.json)
-python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
+Check:
 
-# Second run should SKIP if nothing changed
-python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
-```
+jq . state.json
+tail -n 50 run.log
 
-Check state / logs:
+5. Automate with systemd
 
-```bash
-jq . /opt/otx-publisher/state.json
-tail -n 100 /opt/otx-publisher/run.log
-```
+systemd/otx-publisher.service:
 
-**How dedupe works:** all indicators (IPs/URLs/hashes) are sorted then hashed (SHA256).
-If the fingerprint matches the last run, it **skips** (with optional cooldown/cadence from `publish` section).
-
----
-
-## 5) Automate with systemd
-
-**`systemd/otx-publisher.service`**
-
-```ini
 [Unit]
 Description=Publish T-Pot IOCs to OTX
 After=network-online.target tpot-es-tunnel.service
@@ -196,109 +128,76 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/otx-publisher
-# Use flock to avoid overlapping runs
 ExecStart=/usr/bin/flock -n /opt/otx-publisher/.lock \
   /opt/otx-publisher/venv/bin/python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
 StandardOutput=append:/opt/otx-publisher/run.log
 StandardError=append:/opt/otx-publisher/run.log
-```
 
-**`systemd/otx-publisher.timer`**
 
-```ini
+systemd/otx-publisher.timer (daily at 03:17 UTC):
+
 [Unit]
-Description=Run OTX publisher every 6 hours
+Description=Run OTX publisher daily
 
 [Timer]
-OnCalendar=*-*-* 00/6:17:00
-RandomizedDelaySec=120
+OnCalendar=*-*-* 03:17:00
+AccuracySec=1s
+RandomizedDelaySec=0
 Persistent=true
+Unit=otx-publisher.service
 
 [Install]
 WantedBy=timers.target
-```
 
-Install + start:
 
-```bash
+Install + enable:
+
 sudo cp systemd/otx-publisher.* /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now otx-publisher.timer
-systemctl list-timers | grep otx-publisher
-```
+systemctl list-timers | grep otx
 
-Manual trigger:
+6. Troubleshooting
 
-```bash
-sudo systemctl start otx-publisher.service
-```
+Tunnel down?
 
----
+systemctl status tpot-es-tunnel
 
-## 6) Troubleshooting
 
-**Tunnel down**
+OTX auth?
 
-```bash
-systemctl status tpot-es-tunnel --no-pager
-curl -s http://127.0.0.1:64298/_cluster/health | jq .status
-```
+python publisher/otx_tpot_publisher.py --dry-run --config config.json
 
-**OTX auth**
 
-* Wrong API key → fix `config.json`
-* Outbound egress blocked? allow HTTPS to `otx.alienvault.com`
+Force republish?
 
-**No data**
+rm -f state.json
+python publisher/otx_tpot_publisher.py --config config.json
 
-```bash
-curl -s http://127.0.0.1:64298/_cat/indices?h=index | sort
-# adjust indices or lower "min_event_count"
-```
 
-**Force publish (ignore dedupe)**
+Logs:
 
-```bash
-rm -f /opt/otx-publisher/state.json
-python /opt/otx-publisher/publisher/otx_tpot_publisher.py --config /opt/otx-publisher/config.json
-```
+tail -n 100 run.log
+journalctl -u otx-publisher.service --since "12h"
 
-**Logs**
+7. Security Notes
 
-```bash
-tail -n 100 /opt/otx-publisher/run.log
-journalctl -u otx-publisher --since "12h" --no-pager
-```
+Don’t commit config.json or state.json (they’re gitignored).
 
----
+Only IOCs are shared (IPs, URLs, hashes) — no raw session data.
 
-## 7) Security / Privacy
+Choose tlp: green for public pulses, amber/red for private/internal.
 
-* Keep **real** `config.json` on the VM only (git-ignored).
-* Only IOCs (IPs/URLs/hashes) are exported; no session data or PII.
-* Consider using `tlp: "green"` for public sharing; otherwise make pulses private.
+Example Output
+INFO - Collected IOCs total=153 (IPs=153, URLs=0, Hashes=0)
+INFO - Published pulse: Honeypot Data – Cowrie/T-Pot – last 24h (id=68ab5751f8fb3a0c7f3352d9)
 
----
 
-## 8) What You Should See
+If unchanged:
 
-New IOCs:
-
-```
-INFO - Published pulse: Honeypot Data – Cowrie/T-Pot – last 24h (id=...)
-```
-
-Unchanged:
-
-```
 INFO - Indicators unchanged since last publish (fingerprint match) — skipping.
-```
 
----
-
-## `.gitignore` (commit this)
-
-```
+.gitignore
 # Local config / secrets / state
 config.json
 state.json
@@ -306,9 +205,7 @@ run.log
 
 # Python build stuff
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 .venv/
 venv/
 .env
@@ -317,24 +214,3 @@ venv/
 .DS_Store
 .idea/
 .vscode/
-```
-
----
-
-## `publisher/requirements.txt`
-
-```
-requests
-OTXv2
-```
-
-*(If your Python warns about system package management, venv avoids that.)*
-
----
-
-## Notes
-
-* The pulse title avoids embedding hostnames (stays consistent).
-* Dedupe uses a content fingerprint plus a **cooldown** (`min_interval_minutes`) and a **fallback republish window** (`republish_same_after_hours`) so if attackers keep hammering with the same 157 IPs all day, you don’t publish 4 identical pulses in a row.
-* You can relax/tighten noise with `min_event_count` and `time_window_hours`.
-
