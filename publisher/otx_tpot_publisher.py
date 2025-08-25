@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-import argparse, json, logging, sys, ipaddress, os, hashlib
+import argparse, json, logging, sys, ipaddress, os, hashlib, re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Set, Tuple
+from urllib.parse import urlparse
 import requests
 
 # ---------------- config / logging ----------------
@@ -36,147 +37,194 @@ def is_private_ip(ip: str) -> bool:
     try: return ipaddress.ip_address(ip).is_private
     except Exception: return True
 
-# ---------------- sensor detection ----------------
+# ---------------- sensor detection (fallback) ----------------
 def detect_sensor(src: dict, index_name: str|None=None) -> str:
-    """
-    Best-effort sensor name from common fields, path hints, or index name.
-    Returns lowercase: 'cowrie','suricata','dionaea','honeytrap','tpot','unknown'
-    """
-    cand = []
-
-    # Direct fields present in your sample docs
-    for k in ("type", "eventid", "path", "t-pot_hostname"):
-        v = src.get(k)
-        if isinstance(v, str) and v:
-            cand.append(v.lower())
-
-    # Elastic common fields (keep as fallback if they ever appear)
+    cand=[]
+    for k in ("type","eventid","path","t-pot_hostname"):
+        v=src.get(k);
+        if isinstance(v,str) and v: cand.append(v.lower())
     for k in ("event.module","event.dataset","service.name","program","agent.type","agent.name"):
-        v = src.get(k)
-        if isinstance(v, str) and v:
-            cand.append(v.lower())
-    for k in ("event", "service", "agent"):
-        sub = src.get(k, {})
-        if isinstance(sub, dict):
+        v=src.get(k);
+        if isinstance(v,str) and v: cand.append(v.lower())
+    for k in ("event","service","agent"):
+        sub=src.get(k,{})
+        if isinstance(sub,dict):
             for kk in ("module","dataset","name","type"):
-                vv = sub.get(kk)
-                if isinstance(vv, str) and vv:
-                    cand.append(vv.lower())
-
-    # index name can carry hints in some stacks (yours is logstash-YYYY.MM.DD)
-    if index_name:
-        cand.append(str(index_name).lower())
-
-    blob = " ".join(cand)
-
-    # strong direct checks
-    if "cowrie" in blob:     return "cowrie"
-    if "suricata" in blob:   return "suricata"
-    if "dionaea" in blob:    return "dionaea"
-    if "honeytrap" in blob or "honey" in blob: return "honeytrap"
-    # p0f fingerprint sensor
-    if "p0f" in blob or "/p0f/" in blob: return "p0f"
-
-    # path-based hints
-    if "/cowrie/" in blob:   return "cowrie"
-    if "/suricata/" in blob: return "suricata"
-    if "/dionaea/" in blob:  return "dionaea"
-    if "/honey" in blob:     return "honeytrap"
-
-    # weak fallbacks
-    if "tpot" in blob:       return "tpot"
+                vv=sub.get(kk)
+                if isinstance(vv,str) and vv: cand.append(vv.lower())
+    if index_name: cand.append(str(index_name).lower())
+    blob=" ".join(cand)
+    for kw,canon in (("cowrie","cowrie"),("suricata","suricata"),("dionaea","dionaea"),
+                     ("honeytrap","honeytrap"),("h0neytr4p","honeytrap"),("p0f","p0f")):
+        if kw in blob: return canon
+    if "tpot" in blob: return "tpot"
     return "unknown"
 
-# ---------------- IOC collection ----------------
+# ---------------- URL host helpers ----------------
+def _url_host(u: str) -> str|None:
+    try:
+        netloc = urlparse(u).netloc
+        if not netloc: return None
+        host = netloc.split('@')[-1].split(':')[0].strip('[]')
+        return host.lower()
+    except Exception:
+        return None
+
+def _is_self_url(u: str, local_ips: Set[str]) -> bool:
+    host = _url_host(u)
+    if not host: return False
+    if host in ("localhost","127.0.0.1","::1"): return True
+    # direct IP host only (we DO NOT treat dash-hostnames as self)
+    try:
+        if str(ipaddress.ip_address(host)) in local_ips:
+            return True
+    except Exception:
+        pass
+    return False
+
+# ---------------- IOC collection (composite aggs; refined self-IP) ----------------
 def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]], dict]:
     es=cfg["elasticsearch"]; es_host, es_timeout = es["host"], es["timeout"]
     end_time=datetime.now(timezone.utc)
     start_time=end_time - timedelta(hours=cfg["pulse"]["time_window_hours"])
 
     indices = cfg["indices"]
-    max_indicators = cfg["limits"]["max_indicators"]
-    exclude_private = cfg["pulse"]["exclude_private_ips"]
+    max_indicators = int(cfg["limits"]["max_indicators"])
+    exclude_private = bool(cfg["pulse"]["exclude_private_ips"])
+    min_events = int(cfg["pulse"]["min_event_count"])
 
     iocs = {"ipv4": set(), "urls": set(), "hashes": set()}
     meta = {"ipv4": {}, "urls": {}, "hashes": {}}  # indicator -> set(sensors)
 
-    base_query = {
-        "query": {
-            "bool": {
-                "filter": [
-                    {"range": {"@timestamp": {"gte": _utc_iso(start_time), "lte": _utc_iso(end_time)}}}
-                ]
+    time_query = {"bool":{"filter":[{"range":{"@timestamp":{"gte":_utc_iso(start_time), "lte":_utc_iso(end_time)}}}]}}
+
+    def composite_iter(idx: str, field: str, key_name: str):
+        after=None
+        while True:
+            body={
+                "size":0,
+                "query": time_query,
+                "aggs":{
+                    "by":{
+                        "composite":{"size":1000,"sources":[{key_name:{"terms":{"field":field}}}]},
+                        "aggs":{"sensors":{"terms":{"field":"type.keyword","size":50}}}
+                    }
+                }
             }
-        },
-        "size": 10000,
-        "_source": [
-            "src_ip","source_ip","client_ip",
-            "url","http.url","request.url",
-            "sha256","shasum","fileinfo.sha256","files.sha256",
-            "event","event.module","event.dataset",
-            "service","service.name","program","agent","agent.name","agent.type",
-            "type","eventid","path","t-pot_hostname","event","event.module","event.dataset",
-            "service","service.name","program","agent","agent.name","agent.type"
-        ]
-    }
+            if after: body["aggs"]["by"]["composite"]["after"]=after
+            try:
+                r=es_search(es_host, idx, body, es_timeout)
+                if r.status_code!=200: break
+                ag=r.json().get("aggregations",{}).get("by",{})
+                for b in ag.get("buckets",[]):
+                    key=b.get("key",{}).get(key_name)
+                    if key is None: continue
+                    yield key, int(b.get("doc_count",0)), [sb.get("key","").lower() for sb in b.get("sensors",{}).get("buckets",[]) if sb.get("key")]
+                after=ag.get("after_key")
+                if not after: break
+            except Exception as e:
+                logger.warning(f"composite agg failed for {idx} field {field}: {e}")
+                break
 
-    agg_query = {
-        "size": 0,
-        "query": base_query["query"],
-        "aggs": { "ips": {"terms": {"field": "src_ip.keyword", "size": 20000}} }
-    }
-
-    # pass 1: hot IPs
-    hot_ips=set()
-    for idx in indices:
+    # Normalize a value to a clean IP string, or return None
+    def norm_ip(val: str) -> str|None:
+        if not isinstance(val, str): return None
+        s = val.strip()
+        # Strip ":port" for IPv4 "A.B.C.D:port"
+        if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d+$', s):
+            s = s.split(':',1)[0]
         try:
-            r = es_search(es_host, idx, agg_query, es_timeout)
-            if r.status_code != 200: continue
-            for b in r.json().get("aggregations",{}).get("ips",{}).get("buckets",[]):
-                if b.get("doc_count",0) >= cfg["pulse"]["min_event_count"]:
-                    key = b.get("key")
-                    if key: hot_ips.add(key)
-        except Exception as e:
-            logger.warning(f"agg pass failed for {idx}: {e}")
+            ip = ipaddress.ip_address(s)
+            # exclude unspecified/bogus
+            if ip.is_unspecified: return None
+            return str(ip)
+        except Exception:
+            return None
 
-    # pass 2: docs
+    # ---- Collect destination IP counts to infer local self IP(s)
+    dst_fields = ["dest_ip.keyword","dest_ip","destination.ip","server.ip","host.ip","server.address","destination.address"]
+    dest_counts: Dict[str,int] = {}
     for idx in indices:
-        try:
-            r = es_search(es_host, idx, base_query, es_timeout)
-            if r.status_code != 200: continue
-            for h in r.json().get("hits",{}).get("hits",[]):
-                src = h.get("_source",{})
-                sensor = detect_sensor(src, idx)
-
-                # IPs
-                for fld in ("src_ip","source_ip","client_ip"):
-                    ip = src.get(fld)
+        for fld in dst_fields:
+            try:
+                for raw, cnt, _ in composite_iter(idx, fld, "ip"):
+                    ip = norm_ip(raw)
                     if not ip: continue
+                    dest_counts[ip] = dest_counts.get(ip, 0) + cnt
+            except Exception:
+                continue
+
+    # pick top few dest IPs by volume as local (heuristic)
+    local_ips: Set[str] = set()
+    if dest_counts:
+        top = sorted(dest_counts.items(), key=lambda kv: kv[1], reverse=True)
+        # keep up to 3 with a simple minimum volume guard (>= 1% of top)
+        top1 = top[0][1]
+        for ip, c in top[:3]:
+            if c >= max(10, int(0.01*top1)):
+                local_ips.add(ip)
+        logger.info(f"Self-IP candidates (top dest by count): {[(ip, dest_counts[ip]) for ip in list(local_ips)[:3]]}{' ...' if len(local_ips)>3 else ''}")
+
+    # ---- IPs (union across src fields) with sensor tags from type.keyword
+    ip_counts: Dict[str,int] = {}
+    src_fields = ["src_ip.keyword","source_ip.keyword","client_ip.keyword"]
+    for idx in indices:
+        for fld in src_fields:
+            try:
+                for ip_raw, cnt, sensors in composite_iter(idx, fld, "ip"):
+                    ip = norm_ip(ip_raw)
+                    if not ip or cnt < min_events: continue
                     if exclude_private and is_private_ip(ip): continue
-                    if ip in hot_ips:
-                        iocs["ipv4"].add(ip)
-                        meta["ipv4"].setdefault(ip, set()).add(sensor)
+                    ip_counts[ip]=ip_counts.get(ip,0)+cnt
+                    if sensors: meta["ipv4"].setdefault(ip, set()).update(sensors)
+                    else: meta["ipv4"].setdefault(ip, set())
+            except Exception as e:
+                logger.warning(f"IP agg iterate failed for {idx} {fld}: {e}")
+    for ip in ip_counts.keys():
+        iocs["ipv4"].add(ip)
 
-                # URLs
-                for uf in ("url","http.url","request.url"):
-                    u = src.get(uf)
-                    if u and isinstance(u,str) and (u.startswith("http://") or u.startswith("https://")):
-                        iocs["urls"].add(u)
-                        meta["urls"].setdefault(u, set()).add(sensor)
+    # ---- URLs (aggregate + drop only explicit self IP/localhost hosts)
+    url_fields = ["url.keyword","http.url.keyword","request.url.keyword","url","http.url","request.url"]
+    for idx in indices:
+        for fld in url_fields:
+            try:
+                for u, cnt, sensors in composite_iter(idx, fld, "u"):
+                    if not isinstance(u,str): continue
+                    if not (u.startswith("http://") or u.startswith("https://")): continue
+                    if _is_self_url(u, local_ips):
+                        continue
+                    iocs["urls"].add(u)
+                    if sensors: meta["urls"].setdefault(u,set()).update(sensors)
+                    else: meta["urls"].setdefault(u,set())
+            except Exception:
+                continue
 
-                # Hashes
-                for hf in ("sha256","fileinfo.sha256","files.sha256","shasum"):
-                    hv = src.get(hf)
-                    if hv and isinstance(hv,str) and len(hv) >= 32:
-                        hv = hv.lower()
-                        iocs["hashes"].add(hv)
-                        meta["hashes"].setdefault(hv, set()).add(sensor)
+    # ---- Hashes (aggregate)
+    hash_fields = ["sha256.keyword","fileinfo.sha256.keyword","files.sha256.keyword","shasum.keyword","sha256","fileinfo.sha256","files.sha256","shasum"]
+    for idx in indices:
+        for fld in hash_fields:
+            try:
+                for hv, cnt, sensors in composite_iter(idx, fld, "h"):
+                    if not isinstance(hv,str) or len(hv)<32: continue
+                    hv = hv.lower()
+                    iocs["hashes"].add(hv)
+                    if sensors: meta["hashes"].setdefault(hv,set()).update(sensors)
+                    else: meta["hashes"].setdefault(hv,set())
+            except Exception:
+                continue
 
-                if sum(len(v) for v in iocs.values()) >= max_indicators:
-                    logger.warning("hit max_indicators cap; truncating")
-                    return iocs, meta
-        except Exception as e:
-            logger.warning(f"doc pass failed for {idx}: {e}")
+    # ---- final trim: respect max_indicators but KEEP URLs/Hashes
+    if max_indicators > 0:
+        non_ip = len(iocs["urls"]) + len(iocs["hashes"])
+        room_for_ips = max(0, max_indicators - non_ip)
+        if len(iocs["ipv4"]) > room_for_ips:
+            sorted_ips = sorted(ip_counts.items(), key=lambda kv: kv[1], reverse=True)
+            keep = set(ip for ip,_ in sorted_ips[:room_for_ips])
+            iocs["ipv4"] = keep
+            meta["ipv4"] = {k:v for k,v in meta["ipv4"].items() if k in keep}
+            logging.getLogger("otx-publisher").warning(
+                f"trimmed IPv4s to {room_for_ips} due to max_indicators")
+
     return iocs, meta
 
 # ---------------- dedupe state ----------------
@@ -184,13 +232,13 @@ def indicators_fingerprint(iocs: dict, meta: dict|None=None, include_sensor: boo
     items=[]
     if include_sensor and meta:
         for v in sorted(iocs.get("ipv4", [])):
-            sensors = ",".join(sorted(meta.get("ipv4",{}).get(v, set()))) or "unknown"
+            sensors=",".join(sorted(meta.get("ipv4",{}).get(v, set()))) or "unknown"
             items.append(f"ip:{v}|{sensors}")
         for v in sorted(iocs.get("urls", [])):
-            sensors = ",".join(sorted(meta.get("urls",{}).get(v, set()))) or "unknown"
+            sensors=",".join(sorted(meta.get("urls",{}).get(v, set()))) or "unknown"
             items.append(f"url:{v}|{sensors}")
         for v in sorted(iocs.get("hashes", [])):
-            sensors = ",".join(sorted(meta.get("hashes",{}).get(v, set()))) or "unknown"
+            sensors=",".join(sorted(meta.get("hashes",{}).get(v, set()))) or "unknown"
             items.append(f"hash:{v}|{sensors}")
     else:
         for v in sorted(iocs.get("ipv4", [])):  items.append(f"ip:{v}")
@@ -210,24 +258,17 @@ def save_state(state_path: str, state: dict):
     os.replace(tmp, state_path)
 
 def should_run_daily_only(cfg: dict, state_path: str, logger):
-    # Return True if it's time to publish again based on time only.
-    # Ignores indicator fingerprints entirely.
     pub = cfg.get("publish", {}) if isinstance(cfg.get("publish", {}), dict) else {}
-    # Default to 1440 mins (24h) if not set
     min_mins = int(pub.get("min_interval_minutes", 1440) or 1440)
-
     st = load_state(state_path)
     last_iso = st.get("last_run_utc")
-    last = None
+    last=None
     if last_iso:
-        try:
-            last = datetime.fromisoformat(last_iso)
-        except Exception:
-            last = None
-
+        try: last = datetime.fromisoformat(last_iso)
+        except Exception: last=None
     now = datetime.now(timezone.utc)
     if last and (now - last) < timedelta(minutes=min_mins):
-        logger.info("Daily mode: ran recently — skipping.")
+        logger.info("Daily-only mode: ran recently — skipping.")
         return False
     return True
 
@@ -240,7 +281,7 @@ def should_publish(iocs: dict, cfg: dict, state_path: str, logger, meta: dict|No
         mins = int(pub.get("min_interval_minutes", 0) or 0)
         if mins:
             try: last = datetime.fromisoformat(st.get("last_run_utc"))
-            except Exception: last = None
+            except Exception: last=None
             if last and (datetime.now(timezone.utc) - last < timedelta(minutes=mins)):
                 logger.info("Indicators unchanged and within cool-off — skipping.")
                 return False, fp
@@ -268,7 +309,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     name=f"{prefix} – last {window}h"
     desc=("Indicators observed by T-Pot CE honeypots. "
           "Signals are deduped and filtered (min event count threshold; private IPs excluded). "
-          "Indicators carry per-sensor tags (e.g., cowrie/suricata/dionaea/honeytrap). "
+          "Indicators carry per-sensor tags derived from event 'type'. "
           "Intended for defensive use; infrastructure may be compromised or spoofed. "
           "Sensor: T-Pot CE.")
     indicators=[]
@@ -276,13 +317,10 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     def _clean_tags(tags):
         t = sorted(set(tags))
         return [x for x in t if x != "unknown"] or ["unknown"]
-
-    # Attach per-indicator tags from meta (sensor names) + show in title
     def title_with(sensors: list[str], base: str) -> str:
         if not include_title: return base
-        ss = ", ".join(sensors) if sensors else "unknown"
+        ss = ", ".join(sorted(set(sensors))) if sensors else "unknown"
         return f"{base} • {ss}"
-
     for ip in sorted(iocs["ipv4"]):
         tags = _clean_tags(sorted(meta["ipv4"].get(ip, set())) or ["unknown"])
         indicators.append({"indicator": ip, "type": "IPv4", "title": title_with(tags, "Attacker IP"), "tags": tags})
@@ -294,7 +332,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
         indicators.append({"indicator": h, "type": itype, "title": title_with(tags, "Dropped File Hash"), "tags": tags})
     return {"name":name,"description":desc,"public":(tlp=="GREEN"),"tlp":tlp,
-            "tags":["tpot","cowrie","honeytrap","suricata","dionaea","honeypot","ssh","malicious","sensor-tagged"],
+            "tags":["tpot","honeypot","sensor-tagged","cowrie","suricata","dionaea","honeytrap","p0f","fatt","mailoney","tanner","sentrypeer"],
             "indicators":indicators}
 
 def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logger):
@@ -310,7 +348,7 @@ def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logg
             "https://otx.alienvault.com/api/v1/pulses/create/",
             headers={"X-OTX-API-KEY": api_key, "User-Agent":"otx-publisher/1.0",
                      "Content-Type":"application/json"},
-            data=json.dumps(pulse), timeout=30
+            data=json.dumps(pulse), timeout=60
         )
         r.raise_for_status()
         created = r.json()
@@ -341,18 +379,14 @@ def main():
         logger.warning("No IOCs found in window; skipping publish"); return
 
     state_path = cfg.get("state_path", "/opt/otx-publisher/state.json")
-
-    # --- Daily only check ---
     pub = cfg.get("publish", {}) if isinstance(cfg.get("publish", {}), dict) else {}
     min_mins = int(pub.get("min_interval_minutes", 1440) or 1440)
     st = load_state(state_path)
     last_iso = st.get("last_run_utc")
-    last = None
+    last=None
     if last_iso:
-        try:
-            last = datetime.fromisoformat(last_iso)
-        except Exception:
-            last = None
+        try: last = datetime.fromisoformat(last_iso)
+        except Exception: last=None
     now = datetime.now(timezone.utc)
     if last and (now - last) < timedelta(minutes=min_mins):
         logger.info("Daily-only mode: ran recently — skipping.")
