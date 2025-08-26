@@ -23,15 +23,10 @@ def _utc_iso(dt: datetime) -> str: return dt.replace(tzinfo=timezone.utc).isofor
 def es_health(es_host: str, timeout: int) -> bool:
     try:
         r = requests.get(f"{es_host}/_cluster/health", timeout=timeout)
-        if r.status_code >= 400:
-
-            logger.error(f"OTX error body: {r.text[:2000]}")
-
         r.raise_for_status()
         return r.json().get("status") in ("yellow","green")
     except Exception:
         return False
-
 def es_search(es_host: str, index: str, body: dict, timeout: int):
     url = f"{es_host}/{index}/_search"
     return requests.post(url, headers={"Content-Type":"application/json"},
@@ -76,17 +71,41 @@ def _url_host(u: str) -> str|None:
 
 def _is_self_url(u: str, local_ips: Set[str]) -> bool:
     host = _url_host(u)
-    if not host: return False
-    if host in ("localhost","127.0.0.1","::1"): return True
-    # direct IP host only (we DO NOT treat dash-hostnames as self)
+    if not host:
+        return False
+    if host in ("localhost","127.0.0.1","::1"):
+        return True
+    # direct IP host?
     try:
         if str(ipaddress.ip_address(host)) in local_ips:
             return True
     except Exception:
         pass
+    # dash-encoded host like 194-195-253-210(.domain) → decode and compare
+    first = host.split('.')[0]
+    if re.fullmatch(r'(?:\d{1,3}-){3}\d{1,3}', first):
+        maybe = first.replace('-', '.')
+        try:
+            if str(ipaddress.ip_address(maybe)) in local_ips:
+                return True
+        except Exception:
+            pass
+    # DNS resolution: if host resolves to any local IP, treat as self
+    try:
+        import socket
+        addrs = set()
+        for fam, _, _, _, sockaddr in socket.getaddrinfo(host, None):
+            ip = sockaddr[0]
+            try:
+                ip = str(ipaddress.ip_address(ip))
+                addrs.add(ip)
+            except Exception:
+                pass
+        if addrs & local_ips:
+            return True
+    except Exception:
+        pass
     return False
-
-# ---------------- IOC collection (composite aggs; refined self-IP) ----------------
 def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]], dict]:
     es=cfg["elasticsearch"]; es_host, es_timeout = es["host"], es["timeout"]
     end_time=datetime.now(timezone.utc)
@@ -179,6 +198,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
                     ip = norm_ip(ip_raw)
                     if not ip or cnt < min_events: continue
                     if exclude_private and is_private_ip(ip): continue
+                    if ip in local_ips: continue
                     ip_counts[ip]=ip_counts.get(ip,0)+cnt
                     if sensors: meta["ipv4"].setdefault(ip, set()).update(sensors)
                     else: meta["ipv4"].setdefault(ip, set())
@@ -313,33 +333,50 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
 
 
 def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
+    from collections import Counter
     tlp = cfg["pulse"]["tlp"].upper()
     prefix = cfg["pulse"]["name_prefix"]
     window = cfg["pulse"]["time_window_hours"]
-    me = int(cfg.get("pulse", {}).get("min_event_count", 1))
-    name = f"{prefix} – last {window}h"
+    me = int((cfg.get("pulse", {}) or {}).get("min_event_count", 1))
+    loc = str((cfg.get("pulse", {}) or {}).get("location_label", "")).strip()
+
+    # --- compact sensor suffix (top 4 + "+N") ---
+    sc = Counter()
+    for cat in ("ipv4","urls","hashes"):
+        for sensors in meta.get(cat, {}).values():
+            for s in (sensors or []):
+                s = (s or "").strip().lower()
+                if s and s != "unknown":
+                    sc.update([s])
+    top = [s for s,_ in sc.most_common(4)]
+    if top:
+        more = max(0, len(sc) - len(top))
+        suffix = f" ({'/'.join(top)}" + (f"/+{more}" if more>0 else "") + ")"
+    else:
+        suffix = " (multi-sensor)"
+    name = f"{prefix} – {loc}{suffix} – last {window}h" if loc else f"{prefix}{suffix} – last {window}h"
+
     desc = ("Indicators observed by T-Pot CE honeypots. "
             "Signals are deduped and filtered (min event count threshold; private IPs excluded). "
             "Indicators carry per-sensor tags derived from event 'type'. "
             "Intended for defensive use; infrastructure may be compromised or spoofed. "
-            "Sensor: T-Pot CE.")
-    include_title = bool(cfg.get("pulse", {}).get("include_sensor_in_title", True))
+            "Sensor: T-Pot CE." + (f" Location: {loc}." if loc else ""))
+    include_title = bool((cfg.get("pulse", {}) or {}).get("include_sensor_in_title", True))
 
     def _clean_tags(tags):
         t = sorted(set(tags))
         return [x for x in t if x != "unknown"] or ["unknown"]
 
-    # keep role:* tags out of the human-facing title
+    # keep role:* tags out of human-facing title
     def title_with(sensors: list[str], base: str) -> str:
         if not include_title: return base
-        visible = [t for t in sensors if not (isinstance(t, str) and t.startswith("role:"))]
+        visible = [t for t in sensors if not (isinstance(t, str) and str(t).startswith("role:"))]
         ss = ", ".join(sorted(set(visible))) if visible else "unknown"
         return f"{base} • {ss}"
 
     def desc_for(sensors: list[str]) -> str:
         s = ", ".join(sorted(set([t for t in sensors if not str(t).startswith('role:')]))) or "unknown"
-        return (f"Observed on T-Pot within last {window}h; sensors={s}; "
-                f"threshold≥{me}; private IPs excluded.")
+        return (f"Observed on T-Pot within last {window}h; sensors={s}; threshold≥{me}; private IPs excluded.")
 
     indicators = []
 
@@ -354,7 +391,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
             "tags": tags
         })
 
-    # URLs (keep role only for URLs)
+    # URLs (role kept only for URLs)
     for u in sorted(iocs.get("urls", [])):
         tags = _clean_tags(sorted(meta["urls"].get(u, set())) or ["unknown"])
         indicators.append({
@@ -368,7 +405,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
 
     # Hashes (no role on hashes)
     for h in sorted(iocs.get("hashes", [])):
-        itype = "FileHash-SHA256" if len(h) == 64 else "FileHash-MD5"
+        itype = "FileHash-SHA256" if len(h)==64 else "FileHash-MD5"
         tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
         indicators.append({
             "indicator": h,
