@@ -278,13 +278,6 @@ We use **composite aggregations** to walk all unique values (no 10k doc wobble):
 
 Each bucket is tagged using the event’s **`type.keyword`** (e.g., cowrie, suricata, dionaea, …) so you see far fewer “unknown” tags.
 
-#### Indicator roles (what shows in OTX)
-
-* `URL` → **malware\_hosting**
-* `IPv4/IPv6` with `cowrie` or `honeytrap` sensor tags → **scanning\_host**
-* other `IPv4/IPv6` → **unknown**
-* **File hashes** → *no role set*
-
 ### Self-URL filter (safe)
 
 We **drop only URLs that point to the honeypot itself**:
@@ -305,6 +298,13 @@ We **do NOT** drop dashed hostnames like `194-195-253-210.ip.linodeusercontent.c
   ```
 
   for predictable, to-the-second scheduling.
+
+### Indicator roles (what shows in OTX)
+
+* `URL` → **malware\_hosting**
+* `IPv4/IPv6` with `cowrie` or `honeytrap` sensor tags → **scanning\_host**
+* other `IPv4/IPv6` → **unknown**
+* **File hashes** → *no role set*
 
 ---
 
