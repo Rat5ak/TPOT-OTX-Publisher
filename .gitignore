@@ -1,9 +1,21 @@
-# secrets / local state
+# local config & secrets
 config.json
-state.json
+
+# runtime artifacts
 run.log
-*.pyc
-__pycache__/
-.venv/
+*.log
+state.json
+
+# env / caches
 venv/
-.lock
+.env
+__pycache__/
+*.pyc
+
+# editor & OS
+.DS_Store
+
+# local backups you created
+*.backup-*
+*.bak*
+*.bak.*

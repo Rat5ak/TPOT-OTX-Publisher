@@ -332,6 +332,25 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
 
 
 
+
+
+def _role_for(ioc_type: str, sensors: set[str]) -> str:
+    """
+    Valid OTX roles only. Default is 'unknown'.
+    """
+    s = {str(x).lower() for x in (sensors or [])}
+    t = (ioc_type or "").upper()
+    if t == "URL":
+        return "malware_hosting"
+    if t in ("IPV4", "IPV6"):
+        if {"cowrie","honeytrap"} & s:
+            return "scanning_host"
+        return "unknown"
+    # hashes / anything else
+    return "unknown"
+
+
+
 def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     from collections import Counter
     tlp = cfg["pulse"]["tlp"].upper()
@@ -367,7 +386,6 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         t = sorted(set(tags))
         return [x for x in t if x != "unknown"] or ["unknown"]
 
-    # keep role:* tags out of human-facing title
     def title_with(sensors: list[str], base: str) -> str:
         if not include_title: return base
         visible = [t for t in sensors if not (isinstance(t, str) and str(t).startswith("role:"))]
@@ -380,33 +398,37 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
 
     indicators = []
 
-    # IPs
+    # IPs (+role)
     for ip in sorted(iocs.get("ipv4", [])):
-        tags = _clean_tags(sorted(meta["ipv4"].get(ip, set())) or ["unknown"])
+        sensors = sorted(meta["ipv4"].get(ip, set())) or ["unknown"]
+        tags = _clean_tags(sensors)
         indicators.append({
             "indicator": ip,
             "type": "IPv4",
             "title": title_with(tags, "Attacker IP"),
             "description": desc_for(tags),
-            "tags": tags
+            "tags": tags,
+            "role": _role_for("IPv4", set(sensors))
         })
 
-    # URLs (role kept only for URLs)
+    # URLs (+role)
     for u in sorted(iocs.get("urls", [])):
-        tags = _clean_tags(sorted(meta["urls"].get(u, set())) or ["unknown"])
+        sensors = sorted(meta["urls"].get(u, set())) or ["unknown"]
+        tags = _clean_tags(sensors)
         indicators.append({
             "indicator": u,
             "type": "URL",
             "title": title_with(tags, "Payload URL"),
             "description": desc_for(tags),
             "tags": tags,
-            "role": "malware_hosting"
+            "role": _role_for("URL", set(sensors))
         })
 
-    # Hashes (no role on hashes)
+    # Hashes (NO role — avoid rejection)
     for h in sorted(iocs.get("hashes", [])):
-        itype = "FileHash-SHA256" if len(h)==64 else "FileHash-MD5"
-        tags = _clean_tags(sorted(meta["hashes"].get(h, set())) or ["unknown"])
+        itype = "FileHash-SHA256" if len(h)==64 else ("FileHash-MD5" if len(h)==32 else "FileHash")
+        sensors = sorted(meta["hashes"].get(h, set())) or ["unknown"]
+        tags = _clean_tags(sensors)
         indicators.append({
             "indicator": h,
             "type": itype,
@@ -423,6 +445,8 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         "tags": ["tpot","honeypot","sensor-tagged","cowrie","suricata","dionaea","honeytrap","p0f","fatt","mailoney","tanner","sentrypeer"],
         "indicators": indicators
     }
+
+
 def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logger):
     ip_cnt  = sum(1 for i in pulse["indicators"] if i.get("type") == "IPv4")
     url_cnt = sum(1 for i in pulse["indicators"] if i.get("type") == "URL")

@@ -1,26 +1,22 @@
 {
+  "otx_api_key": "YOUR_API_KEY_HERE",
   "elasticsearch": {
-    "host": "http://localhost:9200",
+    "host": "http://127.0.0.1:YOUR-PORT-HERE",
     "timeout": 10
   },
-  "indices": [
-    "logstash-*"
-  ],
-  "limits": {
-    "max_indicators": 10000
-  },
+  "indices": ["logstash-*"],
   "pulse": {
+    "name_prefix": "Honeypot Data – T-Pot",
     "time_window_hours": 24,
+    "min_event_count": 1,
     "exclude_private_ips": true,
-    "min_event_count": 5,
-    "tlp": "GREEN",
-    "name_prefix": "Honeypot Data – Cowrie/T-Pot",
-    "include_sensor_in_title": true
+    "tlp": "green",
+    "include_sensor_in_title": true,
+    "location_label": "LOCATION-HERE",
+    "local_ips": ["YOUR-HONEYPOT-IP-HERE"]
   },
-  "otx_api_key": "PUT-YOUR-REAL-KEY-HERE",
+  "limits": { "max_indicators": 0 },
+  "publish": { "min_interval_minutes": 1440 },
   "log_path": "/opt/otx-publisher/run.log",
-  "state_path": "/opt/otx-publisher/state.json",
-  "publish": {
-    "min_interval_minutes": 1440
-  }
+  "state_path": "/opt/otx-publisher/state.json"
 }
