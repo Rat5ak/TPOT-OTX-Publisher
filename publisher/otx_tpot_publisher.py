@@ -224,7 +224,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
                 continue
 
     # ---- Hashes (aggregate)
-    hash_fields = ["sha256.keyword","fileinfo.sha256.keyword","files.sha256.keyword","shasum.keyword","sha256","fileinfo.sha256","files.sha256","shasum"]
+    hash_fields = ["sha256.keyword","fileinfo.sha256.keyword","files.sha256.keyword","sha256","fileinfo.sha256","files.sha256",]
     for idx in indices:
         for fld in hash_fields:
             try:
@@ -236,6 +236,44 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
                     else: meta["hashes"].setdefault(hv,set())
             except Exception:
                 continue
+
+    # ---- Hashes from shasum for explicit download/upload events only
+    download_eids = ["cowrie.session.file_download","adbhoney.session.file_download",
+                     "cowrie.session.file_upload","adbhoney.session.file_upload"]
+    for idx in indices:
+        after=None
+        while True:
+            body={
+                "size":0,
+                "query":{"bool":{"filter":[
+                    {"range":{"@timestamp":{"gte":_utc_iso(start_time), "lte":_utc_iso(end_time)}}},
+                    {"terms":{"eventid.keyword": download_eids}}
+                ]}},
+                "aggs":{
+                    "by":{
+                        "composite":{"size":1000,"sources":[{"h":{"terms":{"field":"shasum.keyword"}}}]},
+                        "aggs":{"sensors":{"terms":{"field":"type.keyword","size":50}}}
+                    }
+                }
+            }
+            if after: body["aggs"]["by"]["composite"]["after"]=after
+            try:
+                r=es_search(es_host, idx, body, es_timeout)
+                if r.status_code!=200: break
+                ag=r.json().get("aggregations",{}).get("by",{})
+                for b in ag.get("buckets",[]):
+                    hv=b.get("key",{}).get("h")
+                    if not isinstance(hv,str) or len(hv) not in (32,40,64,128): continue
+                    hv=hv.lower()
+                    iocs["hashes"].add(hv)
+                    sensors=[sb.get("key","").lower() for sb in b.get("sensors",{}).get("buckets",[]) if sb.get("key")]
+                    if sensors: meta["hashes"].setdefault(hv,set()).update(sensors)
+                    else: meta["hashes"].setdefault(hv,set())
+                after=ag.get("after_key")
+                if not after: break
+            except Exception:
+                break
+
 
     # ---- final trim: respect max_indicators but KEEP URLs/Hashes
     if max_indicators > 0:
@@ -327,12 +365,6 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
     except Exception as e:
         logger.error(f"OTX connectivity init failed: {e}")
         return False
-
-
-
-
-
-
 
 def _role_for(ioc_type: str, sensors: set[str]) -> str:
     """
