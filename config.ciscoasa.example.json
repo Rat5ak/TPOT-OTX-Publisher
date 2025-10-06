@@ -1,0 +1,18 @@
+{
+  "elasticsearch": {
+    "host": "http://127.0.0.1:64298",
+    "timeout": 15
+  },
+  "otx_api_key": "REPLACE_WITH_YOUR_OTX_API_KEY",
+  "indices": ["logstash-*"],
+  "pulse": {
+    "name_prefix": "CiscoASA → Attacker IPs",
+    "time_window_hours": 1,
+    "exclude_private_ips": true,
+    "min_event_count": 1,
+    "tlp": "GREEN",
+    "location_label": "Australia",
+    "payload_snip": null
+  },
+  "log_path": "/opt/otx-publisher/ciscoasa.run.log"
+}

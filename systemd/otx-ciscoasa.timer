@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Cisco ASA → OTX publisher hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

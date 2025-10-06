@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse, json, logging, sys, ipaddress, os, hashlib, re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Set, Tuple
@@ -27,6 +26,7 @@ def es_health(es_host: str, timeout: int) -> bool:
         return r.json().get("status") in ("yellow","green")
     except Exception:
         return False
+
 def es_search(es_host: str, index: str, body: dict, timeout: int):
     url = f"{es_host}/{index}/_search"
     return requests.post(url, headers={"Content-Type":"application/json"},
@@ -40,10 +40,10 @@ def is_private_ip(ip: str) -> bool:
 def detect_sensor(src: dict, index_name: str|None=None) -> str:
     cand=[]
     for k in ("type","eventid","path","t-pot_hostname"):
-        v=src.get(k);
+        v=src.get(k); 
         if isinstance(v,str) and v: cand.append(v.lower())
     for k in ("event.module","event.dataset","service.name","program","agent.type","agent.name"):
-        v=src.get(k);
+        v=src.get(k); 
         if isinstance(v,str) and v: cand.append(v.lower())
     for k in ("event","service","agent"):
         sub=src.get(k,{})
@@ -75,13 +75,11 @@ def _is_self_url(u: str, local_ips: Set[str]) -> bool:
         return False
     if host in ("localhost","127.0.0.1","::1"):
         return True
-    # direct IP host?
     try:
         if str(ipaddress.ip_address(host)) in local_ips:
             return True
     except Exception:
         pass
-    # dash-encoded host like 194-195-253-210(.domain) → decode and compare
     first = host.split('.')[0]
     if re.fullmatch(r'(?:\d{1,3}-){3}\d{1,3}', first):
         maybe = first.replace('-', '.')
@@ -90,7 +88,6 @@ def _is_self_url(u: str, local_ips: Set[str]) -> bool:
                 return True
         except Exception:
             pass
-    # DNS resolution: if host resolves to any local IP, treat as self
     try:
         import socket
         addrs = set()
@@ -106,21 +103,79 @@ def _is_self_url(u: str, local_ips: Set[str]) -> bool:
     except Exception:
         pass
     return False
+
+# ---------- enrichment helpers (single pattern query with exists filter) ----------
+def es_iter_enriched_ips(es_host: str, idx_pattern: str, ip_field: str,
+                         start_iso: str, end_iso: str, timeout: int, logger):
+    after = None
+    seen_any = False
+    while True:
+        body = {
+            "size": 0,
+            "query": {"bool":{"filter":[
+                {"range":{"@timestamp":{"gte":start_iso,"lte":end_iso}}},
+                {"exists":{"field": ip_field}}
+            ]}},
+            "aggs": {
+                "by": {
+                    "composite": {
+                        "size": 1000,
+                        "sources": [ {"ip":{"terms":{"field": ip_field}}} ] ,
+                        **({"after": after} if after else {})
+                    },
+                    "aggs": {
+                        "dst_port": {"terms":{"field":"dest_port","size":10}},
+                        "cc": {"terms":{"field":"geoip.country_code2.keyword","size":5}},
+                        "proto": {"terms":{"field":"protocol.keyword","size":5}},
+                        "sensors":{"terms":{"field":"type.keyword","size":50}}
+                    }
+                }
+            }
+        }
+        try:
+            r = es_search(es_host, idx_pattern, body, timeout)
+            if r.status_code != 200:
+                logger.warning(f"enriched agg status={r.status_code} body={r.text[:200]}")
+                break
+            ag = r.json().get("aggregations",{}).get("by",{})
+            buckets = ag.get("buckets", [])
+            if buckets:
+                seen_any = True
+            for b in buckets:
+                ip = b.get("key",{}).get("ip")
+                if not isinstance(ip, str): continue
+                doc_count = int(b.get("doc_count",0) or 0)
+                ports = [int(x.get("key")) for x in b.get("dst_port",{}).get("buckets",[])]
+                ccs   = [str(x.get("key")) for x in b.get("cc",{}).get("buckets",[])]
+                protos= [str(x.get("key")) for x in b.get("proto",{}).get("buckets",[])]
+                sensors=[str(x.get("key","")).lower() for x in b.get("sensors",{}).get("buckets",[]) if x.get("key")]
+                yield ip, doc_count, ports, ccs, protos, sensors
+            after = ag.get("after_key")
+            if not after:
+                break
+        except Exception as e:
+            logger.warning(f"enriched agg failed: {e}")
+            break
+    if not seen_any:
+        logger.warning("No IPs via enriched path — falling back to plain IP aggregation.")
+
 def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]], dict]:
     es=cfg["elasticsearch"]; es_host, es_timeout = es["host"], es["timeout"]
     end_time=datetime.now(timezone.utc)
     start_time=end_time - timedelta(hours=cfg["pulse"]["time_window_hours"])
+    start_iso, end_iso = _utc_iso(start_time), _utc_iso(end_time)
 
     indices = cfg["indices"]
+    idx_pattern = ",".join(indices) if isinstance(indices, list) else str(indices)
     max_indicators = int(cfg["limits"]["max_indicators"])
     exclude_private = bool(cfg["pulse"]["exclude_private_ips"])
     min_events = int(cfg["pulse"]["min_event_count"])
 
     iocs = {"ipv4": set(), "urls": set(), "hashes": set()}
-    meta = {"ipv4": {}, "urls": {}, "hashes": {}}  # indicator -> set(sensors)
+    meta = {"ipv4": {}, "urls": {}, "hashes": {}, "ipv4_enrich": {}}  # extra desc per IP
 
-    time_query = {"bool":{"filter":[{"range":{"@timestamp":{"gte":_utc_iso(start_time), "lte":_utc_iso(end_time)}}}]}}
-
+    # ---------- find local/self IPs (dest heavy hitters) ----------
+    time_query = {"bool":{"filter":[{"range":{"@timestamp":{"gte":start_iso, "lte":end_iso}}}]}}
     def composite_iter(idx: str, field: str, key_name: str):
         after=None
         while True:
@@ -149,22 +204,18 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
                 logger.warning(f"composite agg failed for {idx} field {field}: {e}")
                 break
 
-    # Normalize a value to a clean IP string, or return None
     def norm_ip(val: str) -> str|None:
         if not isinstance(val, str): return None
         s = val.strip()
-        # Strip ":port" for IPv4 "A.B.C.D:port"
         if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d+$', s):
             s = s.split(':',1)[0]
         try:
             ip = ipaddress.ip_address(s)
-            # exclude unspecified/bogus
             if ip.is_unspecified: return None
             return str(ip)
         except Exception:
             return None
 
-    # ---- Collect destination IP counts to infer local self IP(s)
     dst_fields = ["dest_ip.keyword","dest_ip","destination.ip","server.ip","host.ip","server.address","destination.address"]
     dest_counts: Dict[str,int] = {}
     for idx in indices:
@@ -177,35 +228,66 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
             except Exception:
                 continue
 
-    # pick top few dest IPs by volume as local (heuristic)
     local_ips: Set[str] = set()
     if dest_counts:
         top = sorted(dest_counts.items(), key=lambda kv: kv[1], reverse=True)
-        # keep up to 3 with a simple minimum volume guard (>= 1% of top)
         top1 = top[0][1]
         for ip, c in top[:3]:
             if c >= max(10, int(0.01*top1)):
                 local_ips.add(ip)
         logger.info(f"Self-IP candidates (top dest by count): {[(ip, dest_counts[ip]) for ip in list(local_ips)[:3]]}{' ...' if len(local_ips)>3 else ''}")
 
-    # ---- IPs (union across src fields) with sensor tags from type.keyword
+    # ---------- NEW: enriched IP path (pattern + exists filter) ----------
     ip_counts: Dict[str,int] = {}
-    src_fields = ["src_ip.keyword","source_ip.keyword","client_ip.keyword"]
-    for idx in indices:
-        for fld in src_fields:
-            try:
-                for ip_raw, cnt, sensors in composite_iter(idx, fld, "ip"):
-                    ip = norm_ip(ip_raw)
-                    if not ip or cnt < min_events: continue
-                    if exclude_private and is_private_ip(ip): continue
-                    if ip in local_ips: continue
-                    ip_counts[ip]=ip_counts.get(ip,0)+cnt
-                    if sensors: meta["ipv4"].setdefault(ip, set()).update(sensors)
-                    else: meta["ipv4"].setdefault(ip, set())
-            except Exception as e:
-                logger.warning(f"IP agg iterate failed for {idx} {fld}: {e}")
-    for ip in ip_counts.keys():
-        iocs["ipv4"].add(ip)
+    used_enriched = False
+    try:
+        ip_field = "src_ip.keyword"  # discovered in your cluster; change if needed
+        enriched_seen = 0
+        for ip, cnt, ports, ccs, protos, sensors in es_iter_enriched_ips(es_host, idx_pattern, ip_field, start_iso, end_iso, es_timeout, logger):
+            if cnt < min_events: continue
+            if exclude_private and is_private_ip(ip): continue
+            if ip in local_ips: continue
+            ip_counts[ip] = ip_counts.get(ip,0) + cnt
+            iocs["ipv4"].add(ip)
+            # sensors (meta tags)
+            if sensors: meta["ipv4"].setdefault(ip, set()).update(sensors)
+            else: meta["ipv4"].setdefault(ip, set())
+            # compact enrichment string for description
+            def _take(xs, n): return [str(x) for x in xs[:n] if (x or x==0)]
+            ports_s = ",".join(_take(sorted(set(ports)), 5))
+            ccs_s   = ",".join(_take(ccs, 5))
+            protos_s= ",".join(_take(protos, 5))
+            parts = []
+            if ccs_s:   parts.append(f"geo={ccs_s}")
+            if ports_s: parts.append(f"ports={ports_s}")
+            if protos_s:parts.append(f"proto={protos_s}")
+            if parts:
+                meta["ipv4_enrich"][ip] = "; ".join(parts)
+            enriched_seen += 1
+        if enriched_seen:
+            used_enriched = True
+        else:
+            logger.warning("No IPs via enriched path — falling back to plain IP aggregation.")
+    except Exception as e:
+        logger.warning(f"Enriched IP path errored: {e}. Falling back to plain IP aggregation.")
+
+    # ---------- Fallback: plain IP aggregation (old behavior) ----------
+    if not used_enriched:
+        src_fields = ["src_ip.keyword","source_ip.keyword","client_ip.keyword"]
+        for idx in indices:
+            for fld in src_fields:
+                try:
+                    for ip_raw, cnt, sensors in composite_iter(idx, fld, "ip"):
+                        ip = norm_ip(ip_raw)
+                        if not ip or cnt < min_events: continue
+                        if exclude_private and is_private_ip(ip): continue
+                        if ip in local_ips: continue
+                        ip_counts[ip]=ip_counts.get(ip,0)+cnt
+                        iocs["ipv4"].add(ip)
+                        if sensors: meta["ipv4"].setdefault(ip, set()).update(sensors)
+                        else: meta["ipv4"].setdefault(ip, set())
+                except Exception as e:
+                    logger.warning(f"IP agg iterate failed for {idx} {fld}: {e}")
 
     # ---- URLs (aggregate + drop only explicit self IP/localhost hosts)
     url_fields = ["url.keyword","http.url.keyword","request.url.keyword","url","http.url","request.url"]
@@ -224,7 +306,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
                 continue
 
     # ---- Hashes (aggregate)
-    hash_fields = ["sha256.keyword","fileinfo.sha256.keyword","files.sha256.keyword","sha256","fileinfo.sha256","files.sha256",]
+    hash_fields = ["sha256.keyword","fileinfo.sha256.keyword","files.sha256.keyword","sha256","fileinfo.sha256","files.sha256"]
     for idx in indices:
         for fld in hash_fields:
             try:
@@ -246,7 +328,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
             body={
                 "size":0,
                 "query":{"bool":{"filter":[
-                    {"range":{"@timestamp":{"gte":_utc_iso(start_time), "lte":_utc_iso(end_time)}}},
+                    {"range":{"@timestamp":{"gte":start_iso, "lte":end_iso}}},
                     {"terms":{"eventid.keyword": download_eids}}
                 ]}},
                 "aggs":{
@@ -274,7 +356,6 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
             except Exception:
                 break
 
-
     # ---- final trim: respect max_indicators but KEEP URLs/Hashes
     if max_indicators > 0:
         non_ip = len(iocs["urls"]) + len(iocs["hashes"])
@@ -284,6 +365,7 @@ def collect_iocs(cfg: dict, logger: logging.Logger) -> Tuple[Dict[str, Set[str]]
             keep = set(ip for ip,_ in sorted_ips[:room_for_ips])
             iocs["ipv4"] = keep
             meta["ipv4"] = {k:v for k,v in meta["ipv4"].items() if k in keep}
+            meta["ipv4_enrich"] = {k:v for k,v in meta.get("ipv4_enrich",{}).items() if k in keep}
             logging.getLogger("otx-publisher").warning(
                 f"trimmed IPv4s to {room_for_ips} due to max_indicators")
 
@@ -295,7 +377,7 @@ def indicators_fingerprint(iocs: dict, meta: dict|None=None, include_sensor: boo
     if include_sensor and meta:
         for v in sorted(iocs.get("ipv4", [])):
             sensors=",".join(sorted(meta.get("ipv4",{}).get(v, set()))) or "unknown"
-            items.append(f"ip:{v}|{sensors}")
+            items.append(f"ip:{v}|{sensors}|{meta.get('ipv4_enrich',{}).get(v,'')}")
         for v in sorted(iocs.get("urls", [])):
             sensors=",".join(sorted(meta.get("urls",{}).get(v, set()))) or "unknown"
             items.append(f"url:{v}|{sensors}")
@@ -367,9 +449,6 @@ def test_otx_connection(api_key: str, logger: logging.Logger) -> bool:
         return False
 
 def _role_for(ioc_type: str, sensors: set[str]) -> str:
-    """
-    Valid OTX roles only. Default is 'unknown'.
-    """
     s = {str(x).lower() for x in (sensors or [])}
     t = (ioc_type or "").upper()
     if t == "URL":
@@ -378,10 +457,7 @@ def _role_for(ioc_type: str, sensors: set[str]) -> str:
         if {"cowrie","honeytrap"} & s:
             return "scanning_host"
         return "unknown"
-    # hashes / anything else
     return "unknown"
-
-
 
 def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     from collections import Counter
@@ -391,7 +467,6 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
     me = int((cfg.get("pulse", {}) or {}).get("min_event_count", 1))
     loc = str((cfg.get("pulse", {}) or {}).get("location_label", "")).strip()
 
-    # --- compact sensor suffix (top 4 + "+N") ---
     sc = Counter()
     for cat in ("ipv4","urls","hashes"):
         for sensors in meta.get(cat, {}).values():
@@ -424,13 +499,16 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         ss = ", ".join(sorted(set(visible))) if visible else "unknown"
         return f"{base} • {ss}"
 
-    def desc_for(sensors: list[str]) -> str:
+    def desc_for(sensors: list[str], indicator: str|None=None) -> str:
         s = ", ".join(sorted(set([t for t in sensors if not str(t).startswith('role:')]))) or "unknown"
-        return (f"Observed on T-Pot within last {window}h; sensors={s}; threshold≥{me}; private IPs excluded.")
+        base = f"Observed on T-Pot within last {window}h; sensors={s}; threshold≥{me}; private IPs excluded."
+        if indicator and indicator in meta.get("ipv4_enrich", {}):
+            base += f" {meta['ipv4_enrich'][indicator]}"
+        return base
 
     indicators = []
 
-    # IPs (+role)
+    # IPs (+role) with enrichment appended into description
     for ip in sorted(iocs.get("ipv4", [])):
         sensors = sorted(meta["ipv4"].get(ip, set())) or ["unknown"]
         tags = _clean_tags(sensors)
@@ -438,7 +516,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
             "indicator": ip,
             "type": "IPv4",
             "title": title_with(tags, "Attacker IP"),
-            "description": desc_for(tags),
+            "description": desc_for(tags, indicator=ip),
             "tags": tags,
             "role": _role_for("IPv4", set(sensors))
         })
@@ -456,7 +534,7 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
             "role": _role_for("URL", set(sensors))
         })
 
-    # Hashes (NO role — avoid rejection)
+    # Hashes
     for h in sorted(iocs.get("hashes", [])):
         itype = "FileHash-SHA256" if len(h)==64 else ("FileHash-MD5" if len(h)==32 else "FileHash")
         sensors = sorted(meta["hashes"].get(h, set())) or ["unknown"]
@@ -478,7 +556,6 @@ def build_pulse(cfg: dict, iocs: Dict[str, Set[str]], meta: dict) -> dict:
         "indicators": indicators
     }
 
-
 def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logger):
     ip_cnt  = sum(1 for i in pulse["indicators"] if i.get("type") == "IPv4")
     url_cnt = sum(1 for i in pulse["indicators"] if i.get("type") == "URL")
@@ -499,7 +576,6 @@ def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logg
             timeout=60
         )
         if r.status_code >= 400:
-            # print the body so we know *why* (e.g. "too many indicators")
             body = r.text
             logger.error(f"OTX error {r.status_code}: {body[:2000]}")
         r.raise_for_status()
@@ -517,6 +593,7 @@ def publish_pulse(api_key: str, pulse: dict, dry_run: bool, logger: logging.Logg
     except Exception as e:
         logger.error(f"OTX publish failed: {e}")
         raise
+
 # ---------------- main ----------------
 def main():
     p=argparse.ArgumentParser()
