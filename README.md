@@ -1,7 +1,5 @@
 # T-POT → OTX PUBLISHER (and Cisco ASA mode)
 
-Written in my voice — concise, filthy-honest ops doc with everything you need. No fluff. Drop this straight into `README.md` in the repo.
-
 ## Summary — what this is
 
 This is a lightweight, off-box IOC publisher that turns honeypot and firewall log noise into tidy AlienVault OTX Pulses. It sits on a small “publisher” VM, talks to Elasticsearch running on the sensor side over a persistent SSH tunnel (autossh), scrubs and deduplicates indicators, classifies and tags them, and publishes clean pulses on a schedule. It remembers what it sent and won’t spam OTX.
@@ -366,13 +364,5 @@ D. Glossary
 
 ## Final notes — practical, no-bullshit
 
-This is a framework. Right now it's two adapters: T-Pot (general honeypot) and Cisco ASA (IP watchlists). We’re expanding that to support any sensor or appliance you care about. For every new honeypot, appliance, cloud service, or enterprise firewall, we make a small adapter that learns how that data looks, normalises into the publisher shape, and publishes with sensible defaults for windowing and noise suppression.
+This is a framework. Right now it's two adapters: T-Pot (general honeypot) and Cisco ASA (IP watchlists). We can and will expand that to support any sensor or appliance you care about. For every new honeypot, appliance, cloud service, or enterprise firewall, we make a small adapter that learns how that data looks, normalises into the publisher shape, and publishes with sensible defaults for windowing and noise suppression.
 
-If you want, I will:
-
-* produce cleaned `config.json` and `config.ciscoasa.json` examples (sanitised);
-* paste the systemd units and timer files for publisher services (ready to copy);
-* produce adapter scaffolding for a new sensor (FortiGate / Palo Alto / MISP export) with example queries and a test ES fixture;
-* or tighten the Python docstrings + argparse defaults and add a basic `pytest` harness for the normalization logic.
-
-Tell me which of those next steps you want and I’ll dump them ready to copy-paste. — Robert
