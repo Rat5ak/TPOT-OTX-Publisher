@@ -1,0 +1,20 @@
+{
+  "elasticsearch": {
+    "host": "http://127.0.0.1:64298",
+    "timeout": 30
+  },
+  "indices": ["logstash-*"],
+
+  "otx_api_key": "PUT_YOUR_OTX_API_KEY_HERE",
+
+  "pulse": {
+    "name_prefix": "SSH → Attacker IPs",
+    "location_label": "Australia",
+    "time_window_hours": 1,
+    "min_event_count": 1,
+    "tlp": "green",
+    "exclude_private_ips": false
+  },
+
+  "log_path": "ssh.run.log"
+}

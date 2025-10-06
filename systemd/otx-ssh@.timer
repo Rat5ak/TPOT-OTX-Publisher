@@ -1,0 +1,13 @@
+# /etc/systemd/system/otx-ssh@.timer
+[Unit]
+Description=Run OTX SSH publisher hourly (%i)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=10m
+Persistent=true
+Unit=otx-ssh@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+# /etc/systemd/system/otx-ssh@.service
+[Unit]
+Description=OTX SSH publisher (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/otx-publisher
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/otx-publisher/otx_ssh_ips.py --config /opt/otx-publisher/%i
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
