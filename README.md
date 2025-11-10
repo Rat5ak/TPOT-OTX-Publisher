@@ -61,7 +61,6 @@ config.adb.example.json        # ADB / ADBHoney config template (future adapter)
 
 ## How the flow works
 
-```text
 Attackers → T-Pot / ASA / ADBHoney → Elasticsearch (sensor) 
          → autossh tunnel → Publisher VM → OTX pulses
 ```
