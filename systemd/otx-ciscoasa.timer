@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Cisco ASA → OTX publisher hourly
+Description=Run Cisco ASA → OTX publisher Monthly
 
 [Timer]
 OnCalendar=hourly

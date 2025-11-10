@@ -1,0 +1,22 @@
+{
+  "otx_api_key": "YOUR_API_KEY_HERE",
+  "elasticsearch": {
+    "host": "http://127.0.0.1:64298",
+    "timeout": 90
+  },
+  "indices": [
+    "logstash-*"
+  ],
+  "pulse": {
+    "name_prefix": "ADBHoney → Attacker IPs",
+    "time_window_hours": 1,
+    "min_event_count": 1,
+    "exclude_private_ips": false,
+    "tlp": "GREEN",
+    "location_label": "Australia"
+  },
+  "log_path": "/opt/otx-publisher/adb.run.log",
+  "self_ips": [
+    "172.105.186.117","194.195.124.195"
+  ]
+}

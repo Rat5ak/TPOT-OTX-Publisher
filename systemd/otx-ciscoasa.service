@@ -1,5 +1,5 @@
 [Unit]
-Description=Cisco ASA → OTX hourly IP publisher
+Description=Cisco ASA → OTX Monthly publisher
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/otx-publisher
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env python3 /opt/otx-publisher/publisher/otx_ciscoasa_ips_only.py --config /opt/otx-publisher/config.ciscoasa.json
+ExecStart=/usr/bin/env python3 /opt/otx-publisher/publisher/otx_ciscoasa_publisher.py --config /opt/otx-publisher/config.ciscoasa.json
 StandardOutput=journal
 StandardError=journal
 
