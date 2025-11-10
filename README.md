@@ -1,369 +1,289 @@
-# T-POT → OTX PUBLISHER  
-_Honeypots & logs in, clean OTX pulses out._
+# TPOT-OTX-Publisher
 
-This lives on a separate VM, talks to your Elasticsearch over an SSH tunnel, dedupes the junk, adds context, and pushes tidy AlienVault OTX pulses on a schedule. It remembers what it has already sent so you don’t spam OTX or re-publish the same junk every hour.
+Pushes indicators from a **T-Pot honeypot stack** into **AlienVault OTX** as rolling “intelligence” pulses.
 
-Goal: make it dead simple for people running T-Pot and friends to push high-signal IOCs into OTX – and for everyone else to just subscribe to those pulses and use them straight away.
+The idea is:
 
----
+- T-Pot writes everything into **Elasticsearch**.
+- These scripts query ES for interesting attacker activity.
+- New **IPv4** and **file hash** indicators are de-duplicated and pushed into **monthly OTX pulses**.
 
-## What it does right now
+Currently supports:
 
-Adapters (each one is independent):
+- **ADBHoney** (Android ADB honeypot)
+- **SSH honeypot** (e.g. Cowrie / Heralding via T-Pot)
+- **Cisco ASA** logs (via T-Pot / Logstash)
 
-- **T-Pot full honeypot publisher**
-  - Pulls IPs, URLs, SHA256 hashes etc from `logstash-*` (Cowrie, Suricata, Dionaea, etc).
-  - Good for daily or “last 24h” style pulses.
-- **Cisco ASA IPs-only**
-  - Builds a watchlist of attacker IPs from ASA logs.
-  - Optionally includes a snip of `payload_printable` in the description so you can see what they tried.
-- **SSH bruteforce (Cowrie + Heralding)**
-  - Publishes IPs hammering SSH.
-  - Enriches with country, ASN, org, ports, top usernames and passwords (masked), and SSH client strings.
-  - Uses the `bruteforce` role in OTX.
-- **ADB / ADBHoney (in progress)**
-  - Config template is here as `config.adb.example.json`.
-  - This will drive per-sensor ADBHoney pulses and monthly reports once the ADB adapter and reporting sidecar are finished.
-
-Every adapter:
-
-- Talks to ES through a local tunnel (no OTX key or creds on the sensor box).
-- Applies a time window (eg last 1h or 24h).
-- Dedupes across runs using a small state file.
-- Enforces a `max_indicators` limit so you don’t accidentally ship 50k IOCs in one go.
+> ⚠️ The repository is actively evolving and a lot of the newer logic (role classification, hash enrichment, etc.) is AI-assisted. Expect some rough edges.
 
 ---
 
-## Repo layout
+## 1. Features
 
-```text
-publisher/
-  otx_tpot_publisher.py        # full honeypot publisher (IPs, URLs, hashes)
-  otx_ciscoasa_ips_only.py     # Cisco ASA attacker IP publisher
-  otx_ssh_ips.py               # SSH bruteforce attacker IP publisher
-  requirements.txt             # pip deps for all adapters
+### 1.1 General
 
-systemd/
-  tpot-es-tunnel.service       # autossh tunnel to sensor-side Elasticsearch
-  otx-publisher.service        # T-Pot oneshot
-  otx-publisher.timer          # T-Pot schedule (daily by default)
-  otx-ciscoasa.service         # Cisco ASA oneshot
-  otx-ciscoasa.timer           # Cisco ASA schedule (hourly by default)
-  otx-ssh@.service             # SSH oneshot (templated by config path)
-  otx-ssh@.timer               # SSH hourly timer (templated)
+- Pulls data directly from your **T-Pot Elasticsearch**.
+- Builds / updates **monthly OTX pulses**, e.g.:
 
-config.example.json            # T-Pot config template
-config.ciscoasa.example.json   # Cisco ASA config template
-config.ssh.example.json        # SSH config template
-config.adb.example.json        # ADB / ADBHoney config template (future adapter)
+  - `ADBHoney → Attacker IPs – Australia – November 2025`
+  - `SSH → Attacker IPs – Australia – November 2025`
+  - `CiscoASA → Attacker IPs – Australia – November 2025`
+
+- **De-duplicates** indicators so the monthly pulse just grows as new stuff appears.
+- Supports **hourly (or custom) lookback windows**, controlled via config.
+- Skips your own **self IPs**, so you don’t dox your own box.
+
+### 1.2 ADBHoney (otx_adbhoney_rolling.py)
+
+The ADB script is currently the fanciest:
+
+- Detects attacker **IPv4s** via ADBHoney events (with fallback runtime field tricks if ES field mapping is annoying).
+- Pulls **Suricata alert categories** for each IP (if you run Suricata in T-Pot).
+- Inspects **ADB commands** used by the attacker to:
+  - Count hits (`adb_cmd_hits`)
+  - Grab a **sample command preview** for the OTX description.
+- Builds **roles** for each IP:
+  - `scanning_host`
+  - `malware_hosting`
+  - `malware_distribution`
+  - `command_and_control`
+  - (and aliases like `c2` → `command_and_control`)
+- Extracts **file hashes** (SHA-256) from `outfile` fields like:  
+  `dl/<sha256>.raw`
+- Enriches hashes with:
+  - `outfile`
+  - top source IPs and country codes
+  - last seen timestamp
+  - short command preview (`cmds=[...]`)
+- Uses a single **rolling monthly pulse** to publish:
+  - IPv4 indicators (`type="IPv4"`)
+  - File hash indicators (`type="FileHash-SHA256"`)
 
 ---
 
-## How the flow works
+## 2. Files / Scripts (high-level)
 
-Attackers → T-Pot / ASA / ADBHoney → Elasticsearch (sensor) 
-         → autossh tunnel → Publisher VM → OTX pulses
-```
+> File names here are intentionally high-level so the README stays valid even if you re-organise a bit.
 
-* The **sensor** never sees your OTX API key.
-* The **publisher VM** pulls from ES via SSH port-forward and pushes to OTX.
-* Each adapter has its own config, log and state file, so you can run any mix of them.
+- **otx_adbhoney_rolling.py**  
+  Main ADBHoney → OTX publisher. Handles:
+  - ES queries
+  - attacker IP aggregation
+  - hash extraction via `outfile`
+  - role classification
+  - OTX pulse creation / updates
+
+- **SSH publisher script (TBD name)**  
+  Similar idea but for SSH honeypot logs (Cowrie / Heralding).  
+  Typically creates / updates a monthly pulse like:
+  `SSH → Attacker IPs – <location> – <month year>`.
+
+- **CiscoASA publisher script (TBD name)**  
+  Same pattern for Cisco ASA logs.
+
+- **Helper scripts**  
+  Some extra helpers live in the repo for debugging and one-off checks, for example:
+  - `otx_adb_hash_docdump.py`
+  - `otx_adb_hash_lookup.py`
+  - `otx_adb_update_test.py`
+
+These helpers are **optional** and mostly there so you can poke at ES / OTX behaviour without touching the main monthly publisher.
 
 ---
 
-## Requirements
+## 3. Requirements
 
-On the publisher VM:
+- **Python 3.x** (3.9+ recommended)
+- T-Pot environment (or at least an ES instance populated with:
+  - ADBHoney logs
+  - SSH honeypot logs
+  - Cisco ASA logs
+- An **OTX API key** from your AlienVault OTX account.
 
-* Ubuntu 22.04 or 24.04 (Debian works too).
-* `python3`, `python3-venv`
-* `autossh`, `jq`, `git`, `ca-certificates`
-* SSH key that the sensor will accept.
-
-Bootstrap example:
+If you haven’t already, create a venv and install dependencies:
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv autossh jq ca-certificates git
-
-sudo mkdir -p /opt/otx-publisher
-cd /opt/otx-publisher
-
 python3 -m venv venv
 source venv/bin/activate
-pip install --upgrade pip
-pip install -r publisher/requirements.txt
-```
+
+pip install -r requirements.txt   # if present
+# or at minimum:
+pip install requests
+````
 
 ---
 
-## Step 1 – Tunnel Elasticsearch with autossh
+## 4. Configuration
 
-Expose the sensor’s Elasticsearch as `127.0.0.1:64298` on the publisher side.
+Each publisher script expects a JSON config file. The ADBHoney script uses something like:
 
-`systemd/tpot-es-tunnel.service`:
+`/opt/otx-publisher/config.adb.json`
 
-```ini
-[Unit]
-Description=autossh tunnel to T-Pot Elasticsearch
-After=network-online.target
-Wants=network-online.target
+Example:
 
-[Service]
-User=root
-Environment="AUTOSSH_GATETIME=0"
-ExecStart=/usr/bin/autossh -M 0 -N \
-  -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
-  -i /root/.ssh/tpot_publisher_id \
-  -L 64298:127.0.0.1:9200 tpotuser@your-sensor.example
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
+```json
+{
+  "otx_api_key": "YOUR_OTX_API_KEY_HERE",
+  "elasticsearch": {
+    "host": "http://127.0.0.1:64298",
+    "timeout": 15
+  },
+  "indices": ["logstash-*"],
+  "self_ips": [
+    "172.105.186.117",
+    "194.195.124.195"
+  ],
+  "pulse": {
+    "time_window_hours": 199,
+    "min_event_count": 1,
+    "exclude_private_ips": true,
+    "tlp": "green",
+    "name_prefix": "ADBHoney → Attacker IPs",
+    "location_label": "Australia",
+    "tags": ["tpot","honeypot","adb","android","botnet","scanner","dropper"]
+  },
+  "log_path": "/var/log/otx_adbhoney_rolling.log"
+}
 ```
 
-Install and test:
+Key bits:
+
+* `otx_api_key` – your API key for OTX.
+* `elasticsearch.host` – your T-Pot ES endpoint.
+* `indices` – typically `"logstash-*"` for T-Pot.
+* `self_ips` – IPs you never want to publish (your own honeypot / infra).
+* `pulse.time_window_hours` – how far back each run looks in ES.
+* `pulse.name_prefix` + `location_label` – used to build the monthly pulse name.
+
+Other publisher scripts follow the **same pattern** but may use different default `name_prefix` (e.g. `SSH → Attacker IPs`, `CiscoASA → Attacker IPs`, etc.).
+
+---
+
+## 5. Running the ADBHoney publisher
+
+Basic dry-run (does **not** actually create or patch pulses, only logs what it *would* do):
 
 ```bash
-sudo cp systemd/tpot-es-tunnel.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now tpot-es-tunnel.service
+cd /opt/otx-publisher
+source venv/bin/activate
 
-curl -s http://127.0.0.1:64298/_cluster/health | jq .status
-# should be green or yellow
+python3 otx_adbhoney_rolling.py \
+  --config /opt/otx-publisher/config.adb.json \
+  --dry-run
 ```
 
----
-
-## Step 2 – Configs (copy and lock down)
-
-Golden rule: never commit real configs or keys. Copy the examples and keep perms tight.
-
-From `/opt/otx-publisher`:
+Real run:
 
 ```bash
-cp publisher/config.example.json           config.json
-cp publisher/config.ciscoasa.example.json  config.ciscoasa.json
-cp publisher/config.ssh.example.json       config.ssh.json
-cp config.adb.example.json                 config.adb.json   # optional / future ADB adapter
-
-chmod 600 config*.json
+python3 otx_adbhoney_rolling.py \
+  --config /opt/otx-publisher/config.adb.json
 ```
 
-Key fields you will edit (same ideas across adapters):
-
-* `otx_api_key` – your OTX API key.
-* `elasticsearch.host` – normally `http://127.0.0.1:64298`.
-* `indices` – which indices to query, usually `["logstash-*"]`.
-* `pulse.name_prefix` – base name for the pulse.
-* `pulse.time_window_hours` – how far back to look.
-* `pulse.min_event_count` – minimum events before an indicator is kept.
-* `pulse.exclude_private_ips` – toggle whether private ranges are filtered.
-* `pulse.tlp` – TLP for the pulse (green if you want it public).
-* `limits.max_indicators` – sanity cap (0 means unlimited, not recommended).
-* `publish.min_interval_minutes` – cooldown between identical pulses.
-* `log_path`, `state_path` – where to put logs and the dedupe state file.
-
-There is also a dedicated ADB config example (`config.adb.example.json`) which will be used by the ADB/ADBHoney adapter once that code is wired in.
-
----
-
-## Step 3 – Run it by hand
-
-Activate the venv:
+You can override the lookback window on the CLI:
 
 ```bash
-source /opt/otx-publisher/venv/bin/activate
+python3 otx_adbhoney_rolling.py \
+  --config /opt/otx-publisher/config.adb.json \
+  --window-hours 24
 ```
 
-SSH brute-force:
+### Cron example (hourly)
 
 ```bash
-python publisher/otx_ssh_ips.py --dry-run --config config.ssh.json
-python publisher/otx_ssh_ips.py --config config.ssh.json
+0 * * * * cd /opt/otx-publisher && /usr/bin/python3 otx_adbhoney_rolling.py --config /opt/otx-publisher/config.adb.json >> /var/log/otx_adbhoney_rolling.cron.log 2>&1
 ```
 
-Cisco ASA:
-
-```bash
-python publisher/otx_ciscoasa_ips_only.py --dry-run --config config.ciscoasa.json
-python publisher/otx_ciscoasa_ips_only.py --config config.ciscoasa.json
-```
-
-T-Pot full:
-
-```bash
-python publisher/otx_tpot_publisher.py --dry-run --config config.json
-python publisher/otx_tpot_publisher.py --config config.json
-```
-
-Dry-run prints what would be sent to OTX without actually publishing.
+Similar cron entries can be created for your SSH / CiscoASA publisher scripts once you’re happy with them.
 
 ---
 
-## Step 4 – Systemd timers (fire and forget)
+## 6. How the monthly pulses work
 
-### SSH adapter (templated services)
+Each run:
 
-`systemd/otx-ssh@.service`:
+1. Looks back `time_window_hours` in Elasticsearch.
+2. Collects:
 
-```ini
-[Unit]
-Description=OTX SSH publisher (%i)
-After=network-online.target
-Wants=network-online.target
+   * ADB attacker IPs (with some Suricata + ADB command enrichment)
+   * File hashes from `outfile` (e.g. `dl/<sha256>.raw`)
+3. Builds indicator objects:
 
-[Service]
-Type=oneshot
-WorkingDirectory=/opt/otx-publisher
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env python3 /opt/otx-publisher/publisher/otx_ssh_ips.py --config /opt/otx-publisher/%i
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=read-only
+   * IPv4s:
+
+     * `indicator = "<ip>"`
+     * `type = "IPv4"`
+     * `description` includes ports, country, alert categories, adb command preview, etc.
+     * `role` is auto-classified (`scanning_host`, `malware_hosting`, etc.).
+   * Hashes:
+
+     * `indicator = "<sha256>"`
+     * `type = "FileHash-SHA256"`
+     * `description` includes `outfile`, `src_ips`, `cc`, `last_seen`, minimal command preview.
+4. Computes a **monthly pulse name**, e.g.:
+   `ADBHoney → Attacker IPs – Australia – November 2025`
+5. If that monthly pulse doesn’t exist yet:
+
+   * It’s **created** with all indicators seen in this window.
+6. If the pulse already exists:
+
+   * The script **GETs** the pulse,
+   * De-dupes indicators by `(indicator, type)`,
+   * **PATCHes** with only the new ones.
+
+---
+
+## 7. AI-assisted pieces
+
+A lot of the newer logic in this repo was designed in conversation with an LLM (ChatGPT / GPT-5):
+
+* Role classification (`scanning_host` vs `malware_hosting` vs `command_and_control`).
+* The `collect_hash_indicators` function:
+
+  * Outfile → SHA-256 extraction
+  * Hash enrichment (`src_ips`, `cc`, `cmds=[…]`)
+* Runtime Elasticsearch tricks (like `runtime_mappings` to recover IPs when field mappings are messy).
+* Various ES queries to avoid losing any indicators while still being safe.
+
+If you see weird heuristics like:
+
+* `adb_cmd_hits`
+* text-based role classification based on Suricata alert categories
+* string-slicing of previews
+
+…that’s all part of the AI-assisted tuning. Feel free to fork and harden any of this for your own environment.
+
+---
+
+## 8. Housekeeping / TODOs
+
+Things you may want to do to keep the repo clean and consistent:
+
+* [ ] Add / update **requirements.txt** to reflect current Python dependencies.
+* [ ] Add example configs:
+
+  * `config.adb.example.json`
+  * `config.ssh.example.json`
+  * `config.ciscoasa.example.json`
+* [ ] Add a LICENSE file if you want others to use / modify this.
+* [ ] Ensure script naming is consistent:
+
+  * e.g. `otx_adbhoney_rolling.py`, `otx_ssh_rolling.py`, `otx_ciscoasa_rolling.py`.
+* [ ] Document any **known limitations**, e.g.:
+
+  * “Hash src_url is currently not available from our T-Pot ES mapping; only `outfile` is used.”
+
+---
+
+## 9. Disclaimer
+
+This project is provided **as-is**. It’s meant for research / threat-intel enrichment from honeypots, not as a production-grade SIEM product.
+
+You are responsible for:
+
+* Ensuring you’re only sharing data you’re legally / contractually allowed to share.
+* Not accidentally publishing your own infra / customer IPs (use `self_ips`!).
+* Understanding what you push into OTX.
+
+PRs, forks, and tweaks are very welcome.
+
 ```
-
-`systemd/otx-ssh@.timer`:
-
-```ini
-[Unit]
-Description=Run OTX SSH publisher hourly (%i)
-
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
-RandomizedDelaySec=2m
-Persistent=true
-Unit=otx-ssh@%i.service
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable with your config filename as the instance:
-
-```bash
-sudo cp systemd/otx-ssh@.* /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now otx-ssh@config.ssh.json.timer
-
-journalctl -u otx-ssh@config.ssh.json.service -n 50 --no-pager
-```
-
-### Cisco ASA and T-Pot
-
-```bash
-sudo cp systemd/otx-ciscoasa.* /etc/systemd/system/
-sudo cp systemd/otx-publisher.* /etc/systemd/system/
-sudo systemctl daemon-reload
-
-sudo systemctl enable --now otx-ciscoasa.timer
-sudo systemctl enable --now otx-publisher.timer
-
-systemctl list-timers --all | grep -i otx
-```
-
----
-
-## Indicator shaping
-
-Rough sketch of what goes into OTX:
-
-* **SSH adapter**
-
-  * Indicator type: IPv4.
-  * Role: `bruteforce`.
-  * Title: `Attacker IP • SSH`.
-  * Description: event count, sensors (Cowrie, Heralding), ports, country, ASN / org, top usernames and passwords (masked), and the SSH client strings that turned up.
-
-* **Cisco ASA**
-
-  * Indicator type: IPv4.
-  * If `payload_printable.keyword` is present, a snippet is included in the description, de-quoted and trimmed so it is readable.
-
-* **T-Pot full**
-
-  * Mix of IPs, URLs and SHA256s from the usual honeypot stack, tagged in a consistent way with reasonable default roles.
-
-All of them:
-
-* Filter by time window.
-* Deduplicate across runs using a state file.
-* Respect `max_indicators` so you don’t light OTX on fire.
-
----
-
-## Troubleshooting
-
-Some quick checks:
-
-* Tunnel healthy:
-
-  ```bash
-  systemctl status tpot-es-tunnel
-  curl -s http://127.0.0.1:64298/_cluster/health | jq .
-  ```
-
-* SSH adapter noisy?
-
-  ```bash
-  journalctl -u otx-ssh@config.ssh.json.service -n 200 --no-pager
-  ```
-
-* Dry-run first: add `--dry-run` to any adapter.
-
-* Want to force a republish of something?
-
-  * Stop the timer.
-  * Delete the relevant `state.*.json`.
-  * Run the adapter once manually.
-
-* Sanity-check counts with ES directly (cardinality on `src_ip.keyword` with the same filters) if numbers look odd.
-
----
-
-## Where this is heading
-
-Short term:
-
-* Wire in the **ADB / ADBHoney** adapter using `config.adb.json` as the template.
-* Ship **per-sensor monthly and daily pulses** with a clean, repeatable naming scheme.
-* Make the pulses from the public sensors easy to find and subscribe to on OTX.
-
-Medium term:
-
-* More adapters: FortiGate, Palo Alto, Check Point, VPN concentrators, and other honeypots.
-* Optional sinks besides OTX:
-
-  * MISP, internal watchlists, Slack or Teams notifications, etc.
-* A small “Robert” sidecar that:
-
-  * Reads pulse output and raw events.
-  * Spits out human-readable monthly reports per sensor (Markdown that you can throw on a website or blog).
-
-The philosophy stays the same: low friction, high signal, and pulses that other people can just ingest without babysitting every indicator by hand.
-
----
-
-## Safety and hygiene
-
-* Do not commit `config*.json`, `state*.json` or any SSH keys.
-* Lock configs with `chmod 600`.
-* Pick TLP on purpose. Green means public. If it should not leak, do not make it green.
-* Only masked credentials ever go into pulses.
-
----
-
-## License and contributions
-
-MIT vibes. PRs welcome, especially:
-
-* New adapters.
-* Tweaks that make installation smoother.
-* Docs improvements and examples from your own sensors.
-
-If you build cool stuff on top of this or start pushing your own pulses from T-Pot or ASA, feel free to open an issue and link them.
-
-
