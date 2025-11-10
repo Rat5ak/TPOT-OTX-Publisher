@@ -1,4 +1,3 @@
-````markdown
 # T-POT → OTX PUBLISHER  
 _Honeypots & logs in, clean OTX pulses out._
 
@@ -57,13 +56,11 @@ config.example.json            # T-Pot config template
 config.ciscoasa.example.json   # Cisco ASA config template
 config.ssh.example.json        # SSH config template
 config.adb.example.json        # ADB / ADBHoney config template (future adapter)
-````
 
 ---
 
 ## How the flow works
 
-```text
 Attackers → T-Pot / ASA / ADBHoney → Elasticsearch (sensor) 
          → autossh tunnel → Publisher VM → OTX pulses
 ```
