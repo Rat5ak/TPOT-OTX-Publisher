@@ -477,5 +477,3 @@ All publishers support:
 ## License
 
 MIT. Use it, fork it, break it, fix it. PRs welcome.
-
-```
