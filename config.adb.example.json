@@ -1,7 +1,7 @@
 {
   "otx_api_key": "YOUR_API_KEY_HERE",
   "elasticsearch": {
-    "host": "http://127.0.0.1:64298",
+    "host": "http://127.0.0.1:YOUR-PORT-HERE",
     "timeout": 90
   },
   "indices": [
@@ -17,6 +17,6 @@
   },
   "log_path": "/opt/otx-publisher/adb.run.log",
   "self_ips": [
-    "172.105.186.117","194.195.124.195"
+    "SELF-IP-HERE"
   ]
 }
