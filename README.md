@@ -1,9 +1,3 @@
-Alright, had a look at the repo as it sits now – 3 live adapters (T-Pot full, Cisco ASA IPs-only, SSH bruteforce), systemd glue, configs including the new `config.adb.example.json` hanging out waiting for its moment, and the general “off-box ES tunnel → OTX pulses” flow.
-
-Based on that and where you’ve been taking this lately (monthly pulses, ADBHoney, wider sensor mesh, low-friction OTX feed for everyone), here’s a refreshed README you can basically drop in as `README.md` and tweak if you want.
-
----
-
 ````markdown
 # T-POT → OTX PUBLISHER  
 _Honeypots & logs in, clean OTX pulses out._
