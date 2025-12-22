@@ -191,12 +191,3 @@ Set it and forget it.
 
 This isn’t a feed generator.
 It’s a **curated threat-intel publisher**.
-
----
-
-## License
-
-MIT.
-Use it, fork it, break it, improve it.
-
-
