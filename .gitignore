@@ -16,9 +16,11 @@ __pycache__/
 
 # editor & OS
 .DS_Store
+.vscode
 
 # local backups you created
 *.backup-*
 *.bak*
 *.bak.*
+
 
