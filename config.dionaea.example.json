@@ -1,0 +1,33 @@
+{
+  "otx_api_key": "YOUR_API_KEY_HERE",
+  "elasticsearch": {
+    "host": "http://127.0.0.1:YOUR-PORT-HERE",
+    "timeout": 30
+  },
+  "indices": ["logstash-*"],
+
+  "pulse": {
+    "name_prefix": "Dionaea → Attacker IPs",
+    "location_label": "LOCATION-HERE",
+    "time_window_hours": 24,
+    "min_event_count": 1,
+    "exclude_private_ips": false,
+    "tlp": "GREEN",
+
+    "description": "Rolling monthly view of attacker IPv4 addresses observed by Dionaea honeypots on a T-Pot instance (SMB, MSSQL, HTTP, FTP, Telnet, etc). Each run looks back the last 24h and appends newly seen IPs for this month. Location: LOCATION-HERE."
+  },
+
+  "log_path": "/opt/otx-publisher/dionaea.run.log",
+  "state_path": "/opt/otx-publisher/state_dionaea.json",
+
+  "fields": {
+    "ip_field": "src_ip.keyword",
+    "port_field": "dest_port",
+    "cc_field": "geoip.country_code2.keyword",
+    "asn_field": "geoip.asn",
+    "org_field": "geoip.as_org.keyword",
+    "user_field": "username.keyword",
+    "pass_field": "password.keyword",
+    "service_field": "connection.protocol"
+  }
+}

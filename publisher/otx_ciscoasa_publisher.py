@@ -1,12 +1,41 @@
 #!/usr/bin/env python3
-import argparse, json, logging, sys, ipaddress
+import argparse, json, logging, sys, ipaddress, re, os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, Tuple, Set, Optional, List
 import requests
 
 BASE = "https://otx.alienvault.com/api/v1"
 
-# --------------- helpers ---------------
+PULSE_REGISTRY = "/opt/otx-publisher/pulses.json"
+
+# ---- pulse registry (minimal) ----
+def load_pulse_id(key: str) -> Optional[str]:
+    try:
+        with open(PULSE_REGISTRY, "r") as f:
+            data = json.load(f)
+        v = data.get(key)
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def save_pulse_id(key: str, pid: str) -> None:
+    data = {}
+    try:
+        if os.path.exists(PULSE_REGISTRY):
+            with open(PULSE_REGISTRY, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+    except Exception:
+        data = {}
+
+    data[key] = pid
+    with open(PULSE_REGISTRY, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+# -------- helpers --------
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return json.load(f)
@@ -20,7 +49,7 @@ def setup_logger(log_path: Optional[str]):
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=handlers,
     )
-    return logging.getLogger("otx-ssh-rolling")
+    return logging.getLogger("otx-ciscoasa-rolling")
 
 def _utc_iso(dt: datetime) -> str:
     return dt.replace(tzinfo=timezone.utc).isoformat()
@@ -29,14 +58,14 @@ def es_health(es_host: str, timeout: int) -> bool:
     try:
         r = requests.get(f"{es_host}/_cluster/health", timeout=timeout)
         r.raise_for_status()
-        return r.json().get("status") in ("yellow","green")
+        return r.json().get("status") in ("yellow", "green")
     except Exception:
         return False
 
 def es_search(es_host: str, index: str, body: dict, timeout: int):
     return requests.post(
         f"{es_host}/{index}/_search",
-        headers={"Content-Type":"application/json"},
+        headers={"Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=timeout,
     )
@@ -47,158 +76,46 @@ def is_private_ip(ip: str) -> bool:
     except Exception:
         return True
 
-def mask_token(s: str) -> str:
-    if not isinstance(s, str) or not s:
+def _clean_payload(s: str) -> str:
+    """Collapse whitespace and strip outer quotes; do NOT truncate."""
+    if not isinstance(s, str):
         return ""
-    s = s.strip()
-    # mask email-style usernames
-    if "@" in s and "." in s.split("@")[-1]:
-        local, dom = s.split("@", 1)
-        if len(local) <= 2:
-            m = "*" * len(local)
-        else:
-            m = local[0] + ("*" * (len(local)-2)) + local[-1]
-        return f"{m}@{dom}"
-    # mask non-email usernames / passwords
-    if len(s) <= 3:
-        return "*" * len(s)
-    return s[0] + ("*" * (len(s)-2)) + s[-1]
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip('"').strip("'")
+    return s
 
-def top_keys(buckets: list, k="key", n=5) -> List[str]:
-    out=[]
-    for b in (buckets or [])[:n]:
-        v=b.get(k)
-        if isinstance(v,str):
-            out.append(v)
-        elif isinstance(v,(int,float)):
-            out.append(str(v))
-    return out
-
-# --------------- query setup ---------------
-SSH_SHOULD = [
-    {"term":{"type.keyword":"cowrie"}},{"term":{"type.keyword":"Cowrie"}},
-    {"term":{"type.keyword":"heralding"}},{"term":{"type.keyword":"Heralding"}},
-    {"term":{"protocol.keyword":"ssh"}},
-    {"term":{"event.dataset.keyword":"cowrie"}},
-    {"term":{"event.dataset.keyword":"heralding"}},
+# -------- CiscoASA collection --------
+ASA_SHOULD = [
+    {"term": {"type.keyword": "Ciscoasa"}},
+    {"term": {"type.keyword": "ciscoasa"}},
+    {"term": {"event.dataset.keyword": "cisco.asa"}},
+    {"term": {"program.keyword": "ciscoasa"}},
+    {"term": {"service.name.keyword": "ciscoasa"}},
 ]
 
-IP_FIELDS     = ["src_ip.keyword","source_ip.keyword","client_ip.keyword","source.ip","client.ip","source.address.keyword"]
-PORT_FIELDS   = ["dest_port","destination.port","server.port"]
-CC_FIELDS     = ["geoip.country_code2.keyword","geoip.country_iso_code","geoip.country_name.keyword"]
-ASN_FIELDS    = ["geoip.asn"]
-ASORG_FIELDS  = ["geoip.as_org.keyword"]
-USER_FIELDS   = ["username.keyword","user.name.keyword","ssh.username.keyword","cowrie.username.keyword"]
-PASS_FIELDS   = ["password.keyword","ssh.password.keyword","cowrie.password.keyword"]
-CLIENT_FIELDS = ["ssh.client.keyword","ssh.client","ssh.client_version.keyword","client.keyword","network.user_agent.original.keyword"]
-
-# destination-like fields for self-IP auto-detection
-DEST_CANDIDATES = [
-    "destination.ip","dest_ip","server.ip","host.ip","server.address","destination.address",
+SRC_FIELDS = [
+    "src_ip.keyword",
+    "source_ip.keyword",
+    "client_ip.keyword",
+    "source.ip",
+    "client.ip",
+    "source.address.keyword",
 ]
 
-# --- self/service IP detection via runtime field over destination-like paths
-def detect_self_ips(es_host: str, indices: List[str], timeout: int,
-                    start: datetime, end: datetime, logger) -> List[str]:
-    rm = {
-        "dst_rt": {
-            "type": "keyword",
-            "script": {
-                "source": """
-                def fields = params.f;
-                for (def k : fields) {
-                  if (doc.containsKey(k) && !doc[k].empty) {
-                    def v = doc[k].value;
-                    if (v != null) { emit(v.toString()); return; }
-                  }
-                }
-                """,
-                "params": {"f": DEST_CANDIDATES},
-            },
-        },
-    }
-    body = {
-        "size": 0,
-        "query": {
-            "bool": {
-                "filter": [
-                    {"range": {"@timestamp": {"gte": _utc_iso(start), "lte": _utc_iso(end)}}},
-                ],
-                "should": SSH_SHOULD,
-                "minimum_should_match": 1,
-            }
-        },
-        "runtime_mappings": rm,
-        "aggs": {"dst": {"terms": {"field": "dst_rt", "size": 10}}},
-    }
-    top: List[str] = []
-    for idx in indices:
-        try:
-            r = es_search(es_host, idx, body, timeout)
-            if r.status_code != 200:
-                continue
-            buckets = r.json().get("aggregations", {}).get("dst", {}).get("buckets", [])
-            for b in buckets[:3]:
-                k = b.get("key")
-                if not isinstance(k, str):
-                    continue
-                k = k.split(":", 1)[0]
-                try:
-                    ipstr = str(ipaddress.ip_address(k))
-                    if ipstr not in top:
-                        top.append(ipstr)
-                except Exception:
-                    continue
-            if top:
-                break
-        except Exception as e:
-            logger.warning(f"self-ip detect failed: {e}")
-            break
-    if top:
-        logger.info(f"Self IPs (top dest): {top}")
-    else:
-        logger.info("Self IPs not detected (dest runtime path empty).")
-    return top
+PAYLOAD_FIELD = "payload_printable.keyword"
+GEO_CC_FIELD = "geoip.country_code2.keyword"
+GEO_ASN_FIELD = "geoip.asn"
+GEO_ASORG_FIELD = "geoip.as_org.keyword"
 
-# pick a field, but AVOID candidates whose top value is in avoid list (self IPs, etc.)
-def pick_field(es_host: str, indices: List[str], timeout: int, candidates: List[str],
-               start: datetime, end: datetime, avoid: List[str]) -> Optional[str]:
-    avoid_set = set(avoid or [])
-    for idx in indices:
-        for f in candidates:
-            body = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"range": {"@timestamp": {"gte": _utc_iso(start), "lte": _utc_iso(end)}}},
-                            {"exists": {"field": f}},
-                        ],
-                        "should": SSH_SHOULD,
-                        "minimum_should_match": 1,
-                    }
-                },
-                "aggs": {"t": {"terms": {"field": f, "size": 1}}},
-            }
-            try:
-                r = es_search(es_host, idx, body, timeout)
-                if r.status_code != 200:
-                    continue
-                ag = r.json().get("aggregations", {}).get("t", {})
-                buckets = ag.get("buckets") or []
-                if not buckets:
-                    continue
-                top = str(buckets[0].get("key", "")).split(":", 1)[0]
-                if top in avoid_set:
-                    # this field is probably pointing at our own address; skip it
-                    continue
-                return f
-            except Exception:
-                pass
-    return None
-
-# --------------- collection ---------------
-def collect_ssh(cfg: dict, logger) -> Tuple[Dict[str,int], Dict[str,dict]]:
+def collect_ciscoasa_ips_and_enrichment(
+    cfg: dict, logger
+) -> Tuple[Set[str], Dict[str, str], Dict[str, Dict[str, str]]]:
+    """
+    Returns:
+      ips           : set of IPv4s
+      payload_by_ip : ip -> payload_printable (sanitized, full)
+      geo_by_ip     : ip -> {cc, asn, as_org} (strings where present)
+    """
     es = cfg["elasticsearch"]
     es_host = es["host"]
     es_timeout = int(es.get("timeout", 15))
@@ -207,158 +124,325 @@ def collect_ssh(cfg: dict, logger) -> Tuple[Dict[str,int], Dict[str,dict]]:
     start = end - timedelta(hours=hours)
     indices = cfg.get("indices", ["logstash-*"])
     min_events = int(cfg["pulse"].get("min_event_count", 1))
-    exclude_private = bool(cfg["pulse"].get("exclude_private_ips", False))
+    exclude_private = bool(cfg["pulse"].get("exclude_private_ips", True))
 
-    # detect self IPs first (auto) and union with config
-    detected_self = detect_self_ips(es_host, indices, es_timeout, start, end, logger)
-    cfg_self = list(map(str, (cfg.get("self_ips") or []))) if isinstance(cfg.get("self_ips"), list) else []
-    self_ips: Set[str] = set(detected_self) | set(cfg_self)
-    if self_ips:
-        logger.info(f"Using self IPs (detected ∪ config): {sorted(self_ips)}")
+    counts: Dict[str, int] = {}
+    payload_by_ip: Dict[str, str] = {}
+    geo_by_ip: Dict[str, Dict[str, str]] = {}
 
-    # field discovery; avoid picking an IP field whose top value equals a self IP
-    ipf   = pick_field(es_host, indices, es_timeout, IP_FIELDS, start, end, list(self_ips))
-    portf = pick_field(es_host, indices, es_timeout, PORT_FIELDS, start, end, [])
-    ccf   = pick_field(es_host, indices, es_timeout, CC_FIELDS, start, end, [])
-    asnf  = pick_field(es_host, indices, es_timeout, ASN_FIELDS, start, end, [])
-    asorg = pick_field(es_host, indices, es_timeout, ASORG_FIELDS, start, end, [])
-    userf = pick_field(es_host, indices, es_timeout, USER_FIELDS, start, end, [])
-    passf = pick_field(es_host, indices, es_timeout, PASS_FIELDS, start, end, [])
-    clientf = pick_field(es_host, indices, es_timeout, CLIENT_FIELDS, start, end, [])
+    # ---- Pass 1: count unique src IPs (any CiscoASA doc)
+    for idx in indices:
+        for field in SRC_FIELDS:
+            after = None
+            while True:
+                body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {
+                                    "range": {
+                                        "@timestamp": {
+                                            "gte": _utc_iso(start),
+                                            "lte": _utc_iso(end),
+                                        }
+                                    }
+                                }
+                            ],
+                            "should": ASA_SHOULD,
+                            "minimum_should_match": 1,
+                        }
+                    },
+                    "aggs": {
+                        "by": {
+                            "composite": {
+                                "size": 1000,
+                                "sources": [{"ip": {"terms": {"field": field}}}],
+                            }
+                        }
+                    },
+                }
+                if after:
+                    body["aggs"]["by"]["composite"]["after"] = after
+                try:
+                    r = es_search(es_host, idx, body, es_timeout)
+                    if r.status_code != 200:
+                        break
+                    ag = r.json().get("aggregations", {}).get("by", {})
+                    for b in ag.get("buckets", []):
+                        raw = b.get("key", {}).get("ip")
+                        if not isinstance(raw, str):
+                            continue
+                        val = raw.split(":", 1)[0]  # strip ":port" if present
+                        try:
+                            ip = str(ipaddress.ip_address(val))
+                        except Exception:
+                            continue
+                        if exclude_private and is_private_ip(ip):
+                            continue
+                        counts[ip] = counts.get(ip, 0) + int(b.get("doc_count", 0))
+                    after = ag.get("after_key")
+                    if not after:
+                        break
+                except Exception:
+                    break
 
-    if not ipf:
-        logger.error("No aggregatable IP field found for SSH docs; aborting.")
-        return {}, {}
+    ips = {ip for ip, c in counts.items() if c >= min_events}
+    logger.info(f"CiscoASA IPv4s in window: {len(ips)}")
+    if not ips:
+        return set(), {}, {}
 
+    # ---- Pass 2: per-IP payload example (only where payload exists)
+    for idx in indices:
+        for field in SRC_FIELDS:
+            after = None
+            while True:
+                body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {
+                                    "range": {
+                                        "@timestamp": {
+                                            "gte": _utc_iso(start),
+                                            "lte": _utc_iso(end),
+                                        }
+                                    }
+                                },
+                                {"exists": {"field": field}},
+                                {"exists": {"field": PAYLOAD_FIELD}},
+                            ],
+                            "should": ASA_SHOULD,
+                            "minimum_should_match": 1,
+                        }
+                    },
+                    "aggs": {
+                        "by": {
+                            "composite": {
+                                "size": 1000,
+                                "sources": [{"ip": {"terms": {"field": field}}}],
+                            },
+                            "aggs": {
+                                "pp": {
+                                    "terms": {
+                                        "field": PAYLOAD_FIELD,
+                                        "size": 1,
+                                        "order": {"_count": "desc"},
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+                if after:
+                    body["aggs"]["by"]["composite"]["after"] = after
+                try:
+                    r = es_search(es_host, idx, body, es_timeout)
+                    if r.status_code != 200:
+                        break
+                    ag = r.json().get("aggregations", {}).get("by", {})
+                    for b in ag.get("buckets", []):
+                        ip_raw = b.get("key", {}).get("ip")
+                        if not isinstance(ip_raw, str):
+                            continue
+                        ip_val = ip_raw.split(":", 1)[0]
+                        try:
+                            ip = str(ipaddress.ip_address(ip_val))
+                        except Exception:
+                            continue
+                        if ip not in ips:
+                            continue
+                        buckets = (b.get("pp", {}) or {}).get("buckets", [])
+                        if buckets:
+                            sample = buckets[0].get("key")
+                            if isinstance(sample, str) and sample:
+                                payload_by_ip.setdefault(ip, _clean_payload(sample))
+                    after = ag.get("after_key")
+                    if not after:
+                        break
+                except Exception:
+                    break
     logger.info(
-        "Using fields "
-        f"ip={ipf} port={portf} cc={ccf} asn={asnf} org={asorg} "
-        f"user={userf} pass={passf} client={clientf}"
+        f"Enriched payloads attached: {len(payload_by_ip)} of {len(ips)} IPs"
     )
 
-    counts: Dict[str,int] = {}
-    enrich: Dict[str,dict] = {}
-
-    def sub_aggs():
-        a = {"sensors":{"terms":{"field":"type.keyword","size":10}}}
-        if portf:  a["ports"]   = {"terms":{"field":portf,"size":5}}
-        if ccf:    a["cc"]      = {"terms":{"field":ccf,"size":3}}
-        if asnf:   a["asn"]     = {"terms":{"field":asnf,"size":3}}
-        if asorg:  a["asn_org"] = {"terms":{"field":asorg,"size":3}}
-        if userf:  a["user"]    = {"terms":{"field":userf,"size":5}}
-        if passf:  a["pass"]    = {"terms":{"field":passf,"size":5}}
-        if clientf:a["client"]  = {"terms":{"field":clientf,"size":5}}
-        return a
-
+    # ---- Pass 3: per-IP geo (CC/ASN/AS_ORG)
     for idx in indices:
-        after=None
-        while True:
-            body = {
-                "size": 0,
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"range": {"@timestamp": {"gte": _utc_iso(start), "lte": _utc_iso(end)}}},
-                            {"exists": {"field": ipf}},
-                        ],
-                        "should": SSH_SHOULD,
-                        "minimum_should_match": 1,
-                    }
-                },
-                "aggs": {
-                    "by": {
-                        "composite":{"size":1000,"sources":[{"ip":{"terms":{"field": ipf}}}]},
-                        "aggs": sub_aggs(),
-                    }
-                },
-            }
-            if after:
-                body["aggs"]["by"]["composite"]["after"] = after
-            try:
-                r = es_search(es_host, idx, body, es_timeout)
-                if r.status_code != 200:
+        for field in SRC_FIELDS:
+            after = None
+            while True:
+                body = {
+                    "size": 0,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {
+                                    "range": {
+                                        "@timestamp": {
+                                            "gte": _utc_iso(start),
+                                            "lte": _utc_iso(end),
+                                        }
+                                    }
+                                },
+                                {"exists": {"field": field}},
+                                {
+                                    "bool": {
+                                        "should": [
+                                            {"exists": {"field": GEO_CC_FIELD}},
+                                            {"exists": {"field": GEO_ASN_FIELD}},
+                                            {"exists": {"field": GEO_ASORG_FIELD}},
+                                        ],
+                                        "minimum_should_match": 1,
+                                    }
+                                },
+                            ],
+                            "should": ASA_SHOULD,
+                            "minimum_should_match": 1,
+                        }
+                    },
+                    "aggs": {
+                        "by": {
+                            "composite": {
+                                "size": 1000,
+                                "sources": [{"ip": {"terms": {"field": field}}}],
+                            },
+                            "aggs": {
+                                "cc": {
+                                    "terms": {
+                                        "field": GEO_CC_FIELD,
+                                        "size": 1,
+                                        "order": {"_count": "desc"},
+                                    }
+                                },
+                                "asn": {
+                                    "terms": {
+                                        "field": GEO_ASN_FIELD,
+                                        "size": 1,
+                                        "order": {"_count": "desc"},
+                                    }
+                                },
+                                "asorg": {
+                                    "terms": {
+                                        "field": GEO_ASORG_FIELD,
+                                        "size": 1,
+                                        "order": {"_count": "desc"},
+                                    }
+                                },
+                            },
+                        }
+                    },
+                }
+                if after:
+                    body["aggs"]["by"]["composite"]["after"] = after
+                try:
+                    r = es_search(es_host, idx, body, es_timeout)
+                    if r.status_code != 200:
+                        break
+                    ag = r.json().get("aggregations", {}).get("by", {})
+                    for b in ag.get("buckets", []):
+                        ip_raw = b.get("key", {}).get("ip")
+                        if not isinstance(ip_raw, str):
+                            continue
+                        ip_val = ip_raw.split(":", 1)[0]
+                        try:
+                            ip = str(ipaddress.ip_address(ip_val))
+                        except Exception:
+                            continue
+                        if ip not in ips:
+                            continue
+                        entry = geo_by_ip.setdefault(ip, {})
+                        cc_b = (b.get("cc", {}) or {}).get("buckets", [])
+                        asn_b = (b.get("asn", {}) or {}).get("buckets", [])
+                        org_b = (b.get("asorg", {}) or {}).get("buckets", [])
+                        if cc_b:
+                            entry["cc"] = str(cc_b[0].get("key"))
+                        if asn_b:
+                            entry["asn"] = str(asn_b[0].get("key"))
+                        if org_b:
+                            entry["as_org"] = str(org_b[0].get("key"))
+                    after = ag.get("after_key")
+                    if not after:
+                        break
+                except Exception:
                     break
-                ag = r.json().get("aggregations",{}).get("by",{})
-                for b in ag.get("buckets", []):
-                    raw = b.get("key",{}).get("ip")
-                    if not isinstance(raw, str):
-                        continue
-                    ipval = raw.split(":",1)[0]
-                    try:
-                        ip = str(ipaddress.ip_address(ipval))
-                    except Exception:
-                        continue
-                    if ip in self_ips:           # skip self/service IPs
-                        continue
-                    if exclude_private and is_private_ip(ip):
-                        continue
-                    c = int(b.get("doc_count",0))
-                    counts[ip] = counts.get(ip,0) + c
+    logger.info(f"Enriched geo attached: {len(geo_by_ip)} of {len(ips)} IPs")
 
-                    e = enrich.setdefault(ip, {"sensors": set()})
-                    if "ports" in b:   e["ports"]  = top_keys(b["ports"].get("buckets",[]), n=5)
-                    if "cc" in b:      e["cc"]     = top_keys(b["cc"].get("buckets",[]), n=3)
-                    if "asn" in b:     e["asn"]    = top_keys(b["asn"].get("buckets",[]), n=3)
-                    if "asn_org" in b: e["org"]    = top_keys(b["asn_org"].get("buckets",[]), n=3)
-                    if "user" in b:    e["users"]  = [mask_token(x) for x in top_keys(b["user"].get("buckets",[]), n=5)]
-                    if "pass" in b:    e["passes"] = [mask_token(x) for x in top_keys(b["pass"].get("buckets",[]), n=5)]
-                    if "client" in b:  e["client"] = top_keys(b["client"].get("buckets",[]), n=5)
-                    for sb in (b.get("sensors",{}).get("buckets",[]) or []):
-                        sk = sb.get("key")
-                        if isinstance(sk,str) and sk:
-                            e["sensors"].add(sk)
-                after = ag.get("after_key")
-                if not after:
-                    break
-            except Exception:
-                break
+    return ips, payload_by_ip, geo_by_ip
 
-    # drop IPs below min_events
-    for ip in list(enrich.keys()):
-        if counts.get(ip,0) < min_events:
-            enrich.pop(ip, None)
-    counts = {k:v for k,v in counts.items() if v >= min_events}
-
-    logger.info(f"SSH IPv4s in window: {len(counts)}")
-    return counts, enrich
-
-# --------------- indicator builder ---------------
-def build_ip_indicators(cfg: dict, counts: Dict[str,int], enrich: Dict[str,dict]) -> List[dict]:
+# -------- pulse builders --------
+def build_indicators(
+    ips: Set[str], payloads: Dict[str, str], geos: Dict[str, Dict[str, str]]
+) -> List[dict]:
     indicators: List[dict] = []
-    for ip in sorted(counts.keys()):
-        e = enrich.get(ip, {})
-        sensors = sorted(e.get("sensors", set())) or ["unknown"]
-        parts = [
-            f"seen in SSH honeypot; events={counts[ip]}",
-            f"sensors={','.join(sensors)}",
-        ]
-        if e.get("ports"):  parts.append(f"ports={','.join(map(str,e['ports']))}")
-        if e.get("cc"):     parts.append(f"cc={','.join(e['cc'])}")
-        if e.get("asn"):    parts.append(f"asn={','.join(e['asn'])}")
-        if e.get("org"):    parts.append(f"asn_org={','.join(e['org'])}")
-        if e.get("client"): parts.append(f"client={','.join(e['client'])}")
-        if e.get("users"):  parts.append(f"user(top)={','.join(e['users'])}")
-        if e.get("passes"): parts.append(f"pass(top)={','.join(e['passes'])}")
-
-        indicators.append({
-            "indicator": ip,
-            "type": "IPv4",
-            "title": "Attacker IP \u2022 SSH",
-            "description": "; ".join(parts),
-            "tags": ["ssh","cowrie","heralding","tpot","honeypot","bruteforce"],
-            "role": "bruteforce",
-        })
+    for ip in sorted(ips):
+        parts = ["Seen in CiscoASA honeypot logs within the configured window."]
+        if ip in payloads:
+            parts.append(f"request: {payloads[ip]}")
+        g = geos.get(ip, {})
+        geo_bits = []
+        if g.get("cc"):
+            geo_bits.append(g["cc"])
+        if g.get("asn"):
+            if g.get("as_org"):
+                geo_bits.append(f'ASN {g["asn"]} ({g["as_org"]})')
+            else:
+                geo_bits.append(f"ASN {g['asn']}")
+        if geo_bits:
+            parts.append("geo: " + "; ".join(geo_bits))
+        indicators.append(
+            {
+                "indicator": ip,
+                "type": "IPv4",
+                "title": "Attacker IP \u2022 CiscoASA",
+                "description": " ".join(parts),
+                "tags": ["ciscoasa", "tpot", "honeypot"],
+            }
+        )
     return indicators
 
-# --------------- OTX helpers ---------------
+def build_monthly_pulse_base(cfg: dict, indicators: List[dict]) -> dict:
+    tlp = str(cfg["pulse"].get("tlp", "green")).upper()
+    prefix = cfg["pulse"].get("name_prefix", "CiscoASA \u2013 T-Pot")
+    loc = str(cfg["pulse"].get("location_label", "")).strip()
+
+    now = datetime.now(timezone.utc)
+    month_label = now.strftime("%B %Y")
+    base_name = f"{prefix} \u2013 {loc}" if loc else prefix
+    name = f"{base_name} \u2013 {month_label}"
+
+    desc = (
+        "IPv4 addresses observed by CiscoASA honeypot events on T-Pot, "
+        "aggregated for this calendar month. "
+        "Deduped to unique sources; private IPs excluded. "
+        + (f"Location: {loc}. " if loc else "")
+        + "Caveat: request lines alone cannot distinguish scan vs successful exploit; "
+          "device memory inspection is required to confirm compromise."
+    )
+
+    return {
+        "name": name,
+        "description": desc,
+        "public": (tlp == "GREEN"),
+        # include both keys just to be safe with OTX
+        "tlp": tlp,
+        "TLP": tlp,
+        "tags": ["tpot", "honeypot", "ciscoasa", "monthly"],
+        "indicators": indicators,
+    }
+
+# -------- OTX helpers (ADB-style) --------
+def otx_headers(api_key: str) -> dict:
+    return {
+        "X-OTX-API-KEY": api_key,
+        "User-Agent": "otx-ciscoasa-rolling/1.0",
+        "Content-Type": "application/json",
+    }
+
 def test_otx(api_key: str, logger) -> bool:
     try:
-        r = requests.get(
-            f"{BASE}/users/me",
-            headers={"X-OTX-API-KEY": api_key, "User-Agent":"otx-ssh-rolling/1.0"},
-            timeout=10,
-        )
-        ok = (r.status_code == 200)
+        r = requests.get(f"{BASE}/users/me", headers=otx_headers(api_key), timeout=10)
+        ok = r.status_code == 200
         if not ok:
             logger.error(f"OTX auth failed: {r.status_code} {r.text[:200]}")
         return ok
@@ -366,14 +450,11 @@ def test_otx(api_key: str, logger) -> bool:
         logger.error(f"OTX connectivity failed: {e}")
         return False
 
-def otx_headers(api_key: str) -> dict:
-    return {
-        "X-OTX-API-KEY": api_key,
-        "User-Agent": "otx-ssh-rolling/1.0",
-        "Content-Type": "application/json",
-    }
-
 def find_monthly_pulse(api_key: str, name: str, logger) -> Optional[str]:
+    """
+    Look for an existing pulse with the exact given name under /pulses/my.
+    Returns pulse id or None.
+    """
     headers = otx_headers(api_key)
     page = 1
     while page <= 5:
@@ -385,7 +466,9 @@ def find_monthly_pulse(api_key: str, name: str, logger) -> Optional[str]:
                 timeout=30,
             )
             if r.status_code != 200:
-                logger.error(f"OTX list pulses failed page={page}: {r.status_code} {r.text[:300]}")
+                logger.error(
+                    f"OTX list pulses failed page={page}: {r.status_code} {r.text[:300]}"
+                )
                 return None
             data = r.json()
             results = data.get("results") or data.get("pulses") or data
@@ -405,56 +488,51 @@ def get_pulse(api_key: str, pulse_id: str, logger) -> Optional[dict]:
     try:
         r = requests.get(f"{BASE}/pulses/{pulse_id}", headers=headers, timeout=30)
         if r.status_code != 200:
-            logger.error(f"OTX get pulse {pulse_id} failed: {r.status_code} {r.text[:300]}")
+            logger.error(
+                f"OTX get pulse {pulse_id} failed: {r.status_code} {r.text[:300]}"
+            )
             return None
         return r.json()
     except Exception as e:
         logger.error(f"OTX get pulse {pulse_id} exception: {e}")
         return None
 
-def create_pulse(api_key: str, name: str, description: str, tlp: str,
-                 tags: List[str], indicators: List[dict], public: bool,
-                 logger, dry_run: bool) -> Optional[str]:
+def create_pulse(api_key: str, pulse: dict, logger, dry_run: bool) -> Optional[str]:
     headers = otx_headers(api_key)
-    body = {
-        "name": name,
-        "description": description,
-        "public": public,
-        "TLP": tlp,
-        "tags": tags,
-        "indicators": indicators,
-    }
-    ipv4_count = len([i for i in indicators if i.get("type") == "IPv4"])
     if dry_run:
+        inds = pulse.get("indicators") or []
         logger.info(
-            f"[DRY-RUN] Would CREATE monthly SSH pulse '{name}' "
-            f"with {ipv4_count} IPv4s"
+            f"[DRY-RUN] Would CREATE CiscoASA monthly pulse '{pulse.get('name')}' "
+            f"with {len(inds)} indicators"
         )
         return None
-    r = requests.post(f"{BASE}/pulses/create", headers=headers, data=json.dumps(body), timeout=60)
+    r = requests.post(
+        f"{BASE}/pulses/create",
+        headers=headers,
+        data=json.dumps(pulse),
+        timeout=60,
+    )
     if r.status_code >= 400:
-        logger.error(f"Create SSH pulse failed {r.status_code}: {r.text[:500]}")
+        logger.error(f"Create pulse failed {r.status_code}: {r.text[:500]}")
         return None
     created = r.json()
     pid = created.get("id")
-    logger.info(f"Created new SSH monthly pulse: {created.get('name','(no name)')} (id={pid})")
+    logger.info(
+        f"Created CiscoASA monthly pulse: {created.get('name','(no name)')} (id={pid})"
+    )
     return pid
 
-def add_indicators(api_key: str, pulse_id: str, to_add: List[dict], logger, dry_run: bool) -> bool:
+def add_indicators(
+    api_key: str, pulse_id: str, to_add: List[dict], logger, dry_run: bool
+) -> bool:
     if not to_add:
-        logger.info("No new SSH indicators to add to monthly pulse.")
+        logger.info("No new indicators to add to CiscoASA monthly pulse.")
         return True
     headers = otx_headers(api_key)
-    body = {
-        "indicators": {
-            "add": to_add,
-        }
-    }
-    ipv4_count = len([i for i in to_add if i.get("type") == "IPv4"])
+    body = {"indicators": {"add": to_add}}
     if dry_run:
         logger.info(
-            f"[DRY-RUN] Would PATCH SSH pulse id={pulse_id} adding {len(to_add)} indicators "
-            f"({ipv4_count} IPv4s)"
+            f"[DRY-RUN] Would PATCH CiscoASA pulse {pulse_id} adding {len(to_add)} indicators"
         )
         return True
     r = requests.patch(
@@ -464,12 +542,14 @@ def add_indicators(api_key: str, pulse_id: str, to_add: List[dict], logger, dry_
         timeout=60,
     )
     if r.status_code >= 400:
-        logger.error(f"OTX SSH update error {r.status_code}: {r.text[:500]}")
+        logger.error(f"OTX update error {r.status_code}: {r.text[:500]}")
         return False
-    logger.info(f"Successfully patched SSH pulse {pulse_id} with {len(to_add)} new indicators")
+    logger.info(
+        f"Successfully patched CiscoASA monthly pulse {pulse_id} with {len(to_add)} new indicators"
+    )
     return True
 
-# --------------- main ---------------
+# -------- main --------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -492,66 +572,63 @@ def main():
     if not test_otx(cfg["otx_api_key"], logger):
         return
 
-    counts, enrich = collect_ssh(cfg, logger)
-    if not counts:
-        logger.warning("No SSH IPs found in window; skipping")
+    ips, payloads, geos = collect_ciscoasa_ips_and_enrichment(cfg, logger)
+    if not ips:
+        logger.warning("No CiscoASA IPs found in window; skipping")
         return
 
-    hours = int(cfg["pulse"].get("time_window_hours", 1))
-    now = datetime.now(timezone.utc)
-    month_label = now.strftime("%B %Y")
-
-    tlp = str(cfg["pulse"].get("tlp","green")).upper()
-    prefix = cfg["pulse"].get("name_prefix","SSH \u2192 Attacker IPs")
-    loc = str(cfg["pulse"].get("location_label","")).strip()
-    if loc:
-        name = f"{prefix} \u2013 {loc} \u2013 {month_label}"
-    else:
-        name = f"{prefix} \u2013 {month_label}"
-
-    desc = (
-        f"Rolling monthly view for {month_label} of SSH brute-force source IPv4 addresses "
-        f"observed by Cowrie/Heralding on a T-Pot honeypot. Each run looks back the last "
-        f"{hours}h and appends newly seen IPs for this month."
-    )
-    if loc:
-        desc += f" Location: {loc}."
-
-    tags = cfg.get("pulse", {}).get("tags") or ["tpot","honeypot","ssh","cowrie","heralding","bruteforce"]
-    public = (tlp == "GREEN")
-
-    ip_indicators = build_ip_indicators(cfg, counts, enrich)
-    all_new = ip_indicators
-
-    if not all_new:
-        logger.warning("No SSH indicators built from this window; skipping.")
+    hour_inds = build_indicators(ips, payloads, geos)
+    if not hour_inds:
+        logger.warning("No indicators built from CiscoASA window; skipping")
         return
 
+    base_pulse = build_monthly_pulse_base(cfg, hour_inds)
+    pulse_name = base_pulse["name"]
     api_key = cfg["otx_api_key"]
 
-    # look up or create the monthly pulse
-    pulse_id = find_monthly_pulse(api_key, name, logger)
+    # 1) find existing monthly pulse by name
+    now = datetime.now(timezone.utc)
+    reg_key = f"ciscoasa_{now.strftime('%Y-%m')}"
+
+    pulse_id = load_pulse_id(reg_key)
+    if not pulse_id:
+        pulse_id = find_monthly_pulse(api_key, pulse_name, logger)
+        if pulse_id:
+            save_pulse_id(reg_key, pulse_id)
 
     if not pulse_id:
-        pulse_id = create_pulse(api_key, name, desc, tlp, tags, all_new, public, logger, args.dry_run)
-        if not pulse_id and not args.dry_run:
-            logger.error("Failed to create SSH monthly pulse; aborting.")
+        # no existing pulse for this month: create it with current indicators
+        pid = create_pulse(api_key, base_pulse, logger, args.dry_run)
+        if pid and not args.dry_run:
+            save_pulse_id(reg_key, pid)
+        if not pid and not args.dry_run:
+            logger.error("Failed to create CiscoASA monthly pulse; aborting.")
+            return
         return
 
-    # fetch existing indicators and append only new ones
+    # 2) existing pulse: fetch and add only new indicators
     existing = get_pulse(api_key, pulse_id, logger)
     if existing is None:
-        logger.error("Could not fetch existing SSH monthly pulse; aborting.")
+        logger.error("Could not fetch existing CiscoASA monthly pulse; aborting.")
         return
 
     existing_inds = existing.get("indicators") or []
-    existing_keys = {(i.get("indicator"), i.get("type")) for i in existing_inds if isinstance(i, dict)}
+    existing_keys = {
+        (i.get("indicator"), i.get("type"))
+        for i in existing_inds
+        if isinstance(i, dict)
+    }
 
     to_add: List[dict] = []
-    for ind in all_new:
+    for ind in hour_inds:
         key = (ind.get("indicator"), ind.get("type"))
         if key not in existing_keys:
             to_add.append(ind)
+
+    logger.info(
+        f"CiscoASA monthly pulse {pulse_id}: {len(hour_inds)} in this window, "
+        f"{len(to_add)} are new after dedupe"
+    )
 
     add_indicators(api_key, pulse_id, to_add, logger, args.dry_run)
 

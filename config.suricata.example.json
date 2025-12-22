@@ -1,0 +1,36 @@
+{
+  "otx_api_key": "YOUR_API_KEY_HERE",
+  "elasticsearch": {
+    "host": "http://127.0.0.1:YOUR-PORT-HERE",
+    "timeout": 30
+  },
+  "indices": ["logstash-*"],
+
+  "pulse": {
+    "name_prefix": "Suricata → High & Medium Alert IPs",
+    "location_label": "LOCATION-HERE",
+    "time_window_hours": 1,
+    "min_event_count": 1,
+    "exclude_private_ips": false,
+    "tlp": "GREEN",
+
+    "severity_mode": "sev_lte2",
+
+    "description": "Rolling monthly view of source IPv4 addresses that triggered Suricata severity 1–2 (high & medium) IDS alerts on a T-Pot honeypot. Each run looks back the last 1h and appends newly seen IPs for this month. Location: LOCATION-HERE.",
+
+    "tags": ["tpot", "honeypot", "suricata", "ids", "sev<=2"]
+  },
+
+  "log_path": "/opt/otx-publisher/suricata.run.log",
+  "state_path": "/opt/otx-publisher/state_suricata.json",
+
+  "fields": {
+    "ip_field": "src_ip.keyword",
+    "port_field": "dest_port",
+    "cc_field": "geoip.country_code2.keyword",
+    "asn_field": "geoip.asn",
+    "org_field": "geoip.as_org.keyword",
+    "category_field": "alert.category.keyword",
+    "sig_field": "alert.signature.keyword"
+  }
+}

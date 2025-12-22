@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, logging, sys, ipaddress, re
+import argparse, json, logging, sys, ipaddress, re, unicodedata as _U, os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional, Set
 import requests
@@ -15,6 +15,39 @@ ROLE_OK = {
 }
 
 BASE = "https://otx.alienvault.com/api/v1"
+
+# ---------------- pulse registry (month-aware) ----------------
+PULSE_REGISTRY = "/opt/otx-publisher/pulses.json"
+
+
+def load_pulse_id(key: str) -> Optional[str]:
+    try:
+        if os.path.exists(PULSE_REGISTRY):
+            with open(PULSE_REGISTRY, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                v = data.get(key)
+                return str(v) if v else None
+    except Exception:
+        return None
+    return None
+
+
+def save_pulse_id(key: str, pid: str) -> None:
+    data = {}
+    try:
+        if os.path.exists(PULSE_REGISTRY):
+            with open(PULSE_REGISTRY, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+    except Exception:
+        data = {}
+
+    data[key] = pid
+    with open(PULSE_REGISTRY, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
 
 # ---------------- config helpers ----------------
 def load_config(path: str) -> dict:
@@ -193,7 +226,6 @@ def collect_adb_runtime(cfg: dict, logger) -> Tuple[Dict[str,int], Dict[str,dict
         logger.warning(f"runtime ip agg failed: {e}")
 
     logger.info(f"[runtime] ADBHoney IPv4s in window: {len(counts)}")
-    # return placeholders for fields (not used downstream if empty)
     return counts, enrich, "ip_rt", None, None, None, None
 
 # ---------------- collection: base IPs ----------------
@@ -274,7 +306,6 @@ def collect_adb(cfg: dict, logger) -> Tuple[Dict[str,int], Dict[str,dict], str, 
             except Exception:
                 break
 
-    # If normal path found nothing, retry with runtime fallback
     if not counts:
         logger.warning("Standard IP agg returned 0 IPs; retrying with runtime fallback.")
         return collect_adb_runtime(cfg, logger)
@@ -443,16 +474,10 @@ def _classify_role(e: dict) -> str:
         return "malware_distribution"
     return "scanning_host"
 
-# ---------------- Hash indicators (ENRICHED via outfile + command previews) ----------------
+# ---------------- Hash indicators (ENRICHED via outfile + src_ip + src_url + previews) ----------------
 def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, end: datetime,
                             timeout: int, window_hours: int, max_docs: int = 400,
                             self_ips: Optional[Set[str]] = None) -> Tuple[List[dict], Set[str], Set[str]]:
-    """
-    Return:
-      - out:         list of FileHash-SHA256 indicators with enriched description (outfile, src_ip/cc, cmd previews)
-      - extra_ips:   src IPs associated to the hash captures (non-self, non-private)
-      - scanner_ips: reserved for future (currently not populated)
-    """
     session = requests.Session()
     idx_pattern = ",".join(indices)
 
@@ -470,7 +495,7 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
         except Exception:
             return None
 
-    # 1) Aggregate by outfile.keyword (Kibana-style)
+    # 1) Aggregate by outfile.keyword
     body_outfile = {
         "size": 0,
         "track_total_hits": True,
@@ -502,10 +527,10 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
     res = es_s(body_outfile)
     buckets = (res or {}).get("aggregations",{}).get("by_outfile",{}).get("buckets",[]) if res else []
 
-    # regex to pull sha256 from dl/<hash>.raw
     sha_re = re.compile(r"([0-9a-fA-F]{64})")
 
-    # helper: one newest download doc for a given outfile
+    # helper: newest doc for this outfile with URL-ish + text fields
+    CMD_FIELDS = ["input","request","payload_printable","message","event.original"]
     def one_download_doc(outfile):
         body = {
             "size": 1,
@@ -513,8 +538,9 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
             "_source": {
                 "includes": [
                     "@timestamp","outfile","src_ip","src.ip","source.ip",
-                    "geoip.country_code2","geoip.country_code2.keyword"
-                ]
+                    "geoip.country_code2","geoip.country_code2.keyword",
+                    "adbhoney.session.url","url.full"
+                ] + CMD_FIELDS
             },
             "query": {
                 "bool": {
@@ -531,12 +557,15 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
         hits = (r or {}).get("hits",{}).get("hits",[]) if r else []
         return hits[0] if hits else None
 
-    CMD_FIELDS = ["input","request","payload_printable","message","event.original"]
-
     def get_cmd_previews(src_ip, limit=3):
         if not src_ip:
             return []
         must_should = [{"exists":{"field": f}} for f in CMD_FIELDS]
+        ip_should = [
+            {"term":{"src_ip": src_ip}},
+            {"term":{"src.ip": src_ip}},
+            {"term":{"source.ip": src_ip}},
+        ]
         body = {
             "size": limit,
             "sort": [{"@timestamp":{"order":"desc"}}],
@@ -544,11 +573,10 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
             "query": {
                 "bool": {
                     "filter": [
-                        { "range": { "@timestamp": { "gte": _utc_iso(start), "lte": _utc_iso(end) } } },
-                        { "term":  { "src_ip": src_ip } },
+                        { "range": { "@timestamp": { "gte": _utc_iso(start), "lte": _utc_iso(end) } } }
                     ],
                     "must": [{ "bool": { "should": must_should, "minimum_should_match": 1 }}],
-                    "should": ADB_SHOULD,
+                    "should": ADB_SHOULD + ip_should,
                     "minimum_should_match": 1,
                 }
             },
@@ -558,11 +586,7 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
         out = []
         for h in hits:
             s = h.get("_source",{}) or {}
-            v = ""
-            for f in CMD_FIELDS:
-                if s.get(f):
-                    v = s[f]
-                    break
+            v = next((s.get(f) for f in CMD_FIELDS if s.get(f)), "")
             if isinstance(v, dict):
                 try: v = json.dumps(v)
                 except Exception: v = str(v)
@@ -603,6 +627,18 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
 
         dl = one_download_doc(outfile)
         src_ip = get_src_ip(dl.get("_source",{})) if dl else None
+
+        # Find a src_url from structured fields or scrape from text
+        src_url = None
+        if dl:
+            _s = dl.get("_source", {}) or {}
+            src_url = _s.get("adbhoney.session.url") or _s.get("url.full")
+            if not src_url:
+                text = " ".join(str(_s.get(k, "")) for k in CMD_FIELDS)
+                m2 = re.search(r'https?://\S+', text)
+                if m2:
+                    src_url = m2.group(0)
+
         if src_ip:
             try:
                 norm_ip = str(ipaddress.ip_address(src_ip))
@@ -619,6 +655,10 @@ def collect_hash_indicators(es_host: str, indices: List[str], start: datetime, e
             f"Captured within last {window_hours}h by ADBHoney",
             f"outfile={outfile}",
         ]
+        if src_ip:
+            parts.append(f"src_ip={src_ip}")
+        if src_url:
+            parts.append(f"src_url={src_url}")
         if top_src:
             parts.append("src_ips=" + ",".join(top_src[:5]))
         if top_cc:
@@ -663,7 +703,6 @@ def build_ip_indicators(cfg: dict, counts: Dict[str,int], enrich: Dict[str,dict]
             p = e["preview"].replace("\n"," ").replace("\r"," ")
             parts.append(f'cmd="{p[:160]}"')
 
-        # allow a forced role (e.g. research scanners) to override classifier
         if "force_role" in e and e["force_role"]:
             role = _sanitize_role(e["force_role"])
         else:
@@ -702,35 +741,48 @@ def otx_headers(api_key: str) -> dict:
         "Content-Type": "application/json",
     }
 
+def _norm_name(s: str) -> str:
+    # tolerant comparer: normalize unicode, unify arrows/dashes, collapse whitespace, lowercase
+    s = _U.normalize("NFKC", s or "")
+    s = s.replace("->", "→")
+    s = s.replace("—", "–").replace("-", "–")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
 def find_monthly_pulse(api_key: str, name: str, logger) -> Optional[str]:
-    """
-    Look for an existing pulse with the exact given name under /pulses/my.
-    Returns pulse id or None.
-    """
+    want = _norm_name(name)
     headers = otx_headers(api_key)
+
+    # Page through "my pulses"
     page = 1
-    while page <= 5:  # safety bound
+    while page <= 10:
         try:
-            r = requests.get(
-                f"{BASE}/pulses/my",
-                headers=headers,
-                params={"page": page},
-                timeout=30,
-            )
+            r = requests.get(f"{BASE}/pulses/my", headers=headers, params={"page": page}, timeout=30)
             if r.status_code != 200:
                 logger.error(f"OTX list pulses failed page={page}: {r.status_code} {r.text[:300]}")
                 return None
             data = r.json()
-            results = data.get("results") or data.get("pulses") or data
+            results = data.get("results") or data.get("pulses") or []
             if not results:
                 break
             for p in results:
-                if isinstance(p, dict) and p.get("name") == name:
+                if _norm_name(p.get("name","")) == want:
                     return p.get("id")
             page += 1
         except Exception as e:
             logger.error(f"OTX list pulses exception page={page}: {e}")
             return None
+
+    # Fallback to search API in case pagination missed it
+    try:
+        left = name.split("–")[0].strip()
+        s = requests.get(f"{BASE}/search/pulses", headers=headers, params={"q": left}, timeout=30)
+        if s.status_code == 200:
+            for p in s.json().get("results", []):
+                if _norm_name(p.get("name","")) == want:
+                    return p.get("id")
+    except Exception:
+        pass
     return None
 
 def get_pulse(api_key: str, pulse_id: str, logger) -> Optional[dict]:
@@ -778,11 +830,7 @@ def add_indicators(api_key: str, pulse_id: str, to_add: List[dict], logger, dry_
         logger.info("No new indicators to add to monthly pulse.")
         return True
     headers = otx_headers(api_key)
-    body = {
-        "indicators": {
-            "add": to_add
-        }
-    }
+    body = { "indicators": { "add": to_add } }
     if dry_run:
         logger.info(
             f"[DRY-RUN] Would PATCH pulse id={pulse_id} adding {len(to_add)} indicators "
@@ -843,13 +891,13 @@ def main():
         es_host, indices, start, end, es_timeout, hours, self_ips=self_ips
     )
 
-    # merge extra IPs into counts/enrich (so they become IPv4 IOCs too)
+    # merge extra IPs into counts/enrich so they also become IPv4 IOCs
     for ip in extra_ips:
         if ip not in counts:
             counts[ip] = 1
         enrich.setdefault(ip, {})
 
-    # mark research/scanner IPs so they get role=scanning_host (unused right now but kept)
+    # mark research/scanner IPs (reserved for future)
     for ip in scanner_ips:
         e = enrich.setdefault(ip, {})
         e.setdefault("force_role", "scanning_host")
@@ -861,7 +909,6 @@ def main():
     ip_indicators = build_ip_indicators(cfg, counts, enrich, cats, cmd)
     all_new_from_window = ip_indicators + hash_inds
 
-    # If somehow we ended up with no indicators, bail
     if not all_new_from_window:
         logger.warning("No indicators (IP or hash) built from this window; skipping.")
         return
@@ -872,10 +919,7 @@ def main():
     loc = str(cfg["pulse"].get("location_label","")).strip()
     now = datetime.now(timezone.utc)
     month_label = now.strftime("%B %Y")
-    if loc:
-        name = f"{prefix} \u2013 {loc} \u2013 {month_label}"
-    else:
-        name = f"{prefix} \u2013 {month_label}"
+    name = f"{prefix} \u2013 {loc} \u2013 {month_label}" if loc else f"{prefix} \u2013 {month_label}"
 
     desc = (
         f"Rolling monthly view for {month_label} of IPv4 addresses and file hashes observed by "
@@ -890,12 +934,20 @@ def main():
 
     api_key = cfg["otx_api_key"]
 
-    # 1) see if monthly pulse already exists
-    pulse_id = find_monthly_pulse(api_key, name, logger)
+    # 1) see if monthly pulse already exists (tolerant)
+    reg_key = f"adbhoney_{now.strftime('%Y-%m')}"
+
+    pulse_id = load_pulse_id(reg_key)
+    if not pulse_id:
+        pulse_id = find_monthly_pulse(api_key, name, logger)
+        if pulse_id:
+            save_pulse_id(reg_key, pulse_id)
 
     if not pulse_id:
         # Create fresh monthly pulse with everything we have in this window
         pulse_id = create_pulse(api_key, name, desc, tlp, tags, all_new_from_window, public, logger, args.dry_run)
+        if pulse_id and not args.dry_run:
+            save_pulse_id(reg_key, pulse_id)
         if not pulse_id and not args.dry_run:
             logger.error("Failed to create monthly pulse; aborting.")
         return
